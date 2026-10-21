@@ -9,7 +9,7 @@ A built copy is [`Link.Download.exe`](https://github.com/oiuy-retro/link-downloa
 Wizard pages: Options, Links, Names, Titles, Metadata, Download.
 
 - Profiles save your settings (format, quality, SponsorBlock, genre stripping, wait times, and download folder) so you can reuse them.
-- Audio-only Opus in `.m4a`, or video (default 1080p H.264 AAC MP4).
+- Video or audio only, in the resolution, codecs, audio quality and container you pick (144p to 4320p; H.264, H.265, VP9, AV1 and more; MP4, MKV, WebM, M4A, MP3, Opus, FLAC and more).
 - **Strip genre and description** is on by default so YouTube categories and the video description are not stored as tags.
 - **SponsorBlock** (off by default) cuts sponsor, self-promotion, and interaction segments through yt-dlp. Cuts are stream-copy; they land on keyframes.
 - Cover art: Matroska attachment `cover.jpg`, or an `attached_pic` still on MP4/M4A.
