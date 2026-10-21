@@ -2,7 +2,7 @@
 
 Windows 98–style GUI for [yt-dlp](https://github.com/yt-dlp/yt-dlp). Download videos or audio, remux with FFmpeg, edit names and tags, then write files to a folder you pick.
 
-A built copy is in [`dist/Link Download.exe`](dist/Link%20Download.exe). Put [`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp/releases), [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/), [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`), and [`node.exe`](https://nodejs.org/) in the same folder as the program.
+A built copy is [`Link.Download.exe`](https://github.com/oiuy-retro/link-download/releases/latest/download/Link.Download.exe) on the [latest release](https://github.com/oiuy-retro/link-download/releases/latest). Put [`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp/releases), [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/), [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`), and [`node.exe`](https://nodejs.org/) in the same folder as the program.
 ```
 sha256: 4bbcc95327e1519d4874a06e214ed247a3ab5aa657c3d80c12633bc4913e3dd5
 ```
@@ -22,7 +22,7 @@ The window uses owner-drawn Windows 98 chrome. The folder picker is the real Exp
 
 ## Run
 
-1. Copy `dist/Link Download.exe` to a folder.
+1. Copy `Link.Download.exe` from the [latest release](https://github.com/oiuy-retro/link-download/releases/latest) to a folder.
 2. Place these files beside it:
    - [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases) `yt-dlp.exe`
    - [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) `ffmpeg.exe` and `ffprobe.exe` (both ship in the same build)
