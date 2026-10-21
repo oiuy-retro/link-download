@@ -3,25 +3,8 @@
 Windows 98–style GUI for [yt-dlp](https://github.com/yt-dlp/yt-dlp). Download videos or audio, remux with FFmpeg, edit names and tags, then write files to a folder you pick.
 
 A built copy is in [`dist/Link Download.exe`](dist/Link%20Download.exe). Put [`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp/releases), [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/), [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) (it ships in the same FFmpeg build as `ffmpeg.exe`), and [`node.exe`](https://nodejs.org/) in the same folder as the program.
-
-## Verify the download
-
-SHA-256 of [`dist/Link Download.exe`](dist/Link%20Download.exe):
-
-```text
-4bbcc95327e1519d4874a06e214ed247a3ab5aa657c3d80c12633bc4913e3dd5
 ```
-
-The same hash is in [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt). To check a copy on Windows, run this in PowerShell from the repository folder and compare the hash:
-
-```powershell
-Get-FileHash ".\dist\Link Download.exe" -Algorithm SHA256
-```
-
-Or, from Command Prompt:
-
-```bat
-certutil -hashfile "dist\Link Download.exe" SHA256
+sha256: 4bbcc95327e1519d4874a06e214ed247a3ab5aa657c3d80c12633bc4913e3dd5
 ```
 
 ## What it does
