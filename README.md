@@ -2,20 +2,17 @@
 
 Windows 98–style GUI for [yt-dlp](https://github.com/yt-dlp/yt-dlp). Download videos or audio, remux with FFmpeg, edit names and tags, then write files to a folder you pick.
 
-A built copy is [`Link.Download.exe`](https://github.com/oiuy-retro/link-download/releases/latest/download/Link.Download.exe) on the [latest release](https://github.com/oiuy-retro/link-download/releases/latest). Put [`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp/releases), [`ffmpeg.exe`](https://www.gyan.dev/ffmpeg/builds/), [`ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/), and [`node.exe`](https://nodejs.org/) in the same folder as the program.
+A built copy is [`Link.Download.exe`](https://github.com/oiuy-retro/link-download/releases/latest/download/Link.Download.exe) on the [latest release](https://github.com/oiuy-retro/link-download/releases/latest).
 
 ## What it does
 
 Wizard pages: Options, Links, Names, Titles, Metadata, Download.
 
-- Profiles in `%AppData%\Link Download\profiles.json`.
+- Profiles save your settings (format, quality, SponsorBlock, genre stripping, wait times, and download folder) so you can reuse them.
 - Audio-only Opus in `.m4a`, or video (default 1080p H.264 AAC MP4).
 - **Strip genre and description** is on by default so YouTube categories and the video description are not stored as tags.
 - **SponsorBlock** (off by default) cuts sponsor, self-promotion, and interaction segments through yt-dlp. Cuts are stream-copy; they land on keyframes.
 - Cover art: Matroska attachment `cover.jpg`, or an `attached_pic` still on MP4/M4A.
-- Finished rows leave the list. Speed, items per second, files left, time left, and elapsed match the other desktop tools.
-
-The window uses owner-drawn Windows 98 chrome. The folder picker is the real Explorer dialog.
 
 ## Run
 

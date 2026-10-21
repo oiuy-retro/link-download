@@ -2,6 +2,8 @@
 
 Link Download links against or is meant to run next to the following projects. This repository ships the Link Download sources and a built `dist/Link Download.exe`. It does not ship yt-dlp, FFmpeg, or Node.js.
 
+Tested with yt-dlp `2026.10.10.233141`, FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), and Node `v24.16.0`.
+
 ## Rust crates (linked into the exe)
 
 | Project | License | Use |
