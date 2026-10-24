@@ -134,6 +134,49 @@ fn album_folder(group: &Group) -> Option<String> {
     None
 }
 
+/// Cleans up what was typed in the Location box and turns it into a full path.
+///
+/// - Spaces around it and one pair of surrounding quotes are removed, so a path
+///   pasted with Explorer's "Copy as path" works.
+/// - A relative path such as `Music` or `.\\Music` becomes a full path. Without
+///   this the app, yt-dlp and ffmpeg each read it from a different starting
+///   folder, and the downloads and conversions failed.
+/// - `/` becomes `\\`, and `.` and `..` are resolved.
+///
+/// An empty box stays empty. Next is already greyed out for that.
+pub fn clean_location(text: &str) -> Result<String, String> {
+    let mut text = text.trim();
+    for quote in ['"', '\''] {
+        if text.len() >= 2 && text.starts_with(quote) && text.ends_with(quote) {
+            text = text[1..text.len() - 1].trim();
+            break;
+        }
+    }
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    let bad = |part: &str| part.chars().find(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*') || (*c as u32) < 32);
+    for part in Path::new(text).components() {
+        if let std::path::Component::Normal(name) = part {
+            if let Some(c) = bad(&name.to_string_lossy()) {
+                let shown = if (c as u32) < 32 { "a control character".to_string() } else { format!("\"{c}\"") };
+                return Err(format!("The Location \"{text}\" can't be used: folder names can't contain {shown}."));
+            }
+        }
+    }
+    let full = std::path::absolute(text).map_err(|err| format!("The Location \"{text}\" can't be used as a folder: {err}."))?;
+    Ok(full.display().to_string())
+}
+
+/// The `-o` value for yt-dlp: the folder, then the file name with the
+/// extension left for yt-dlp to fill in. yt-dlp reads `%(...)s` as a field to
+/// fill, even inside the folder part, so every `%` in the folder is doubled.
+/// The file name part never has `%` in it (`download_stem` removes it).
+pub fn output_template(dir: &Path, stem: &str) -> String {
+    let folder = dir.display().to_string().replace('%', "%%");
+    Path::new(&folder).join(format!("{stem}.%(ext)s")).display().to_string()
+}
+
 pub fn output_dir(location: &Path, group: &Group, item_index: usize) -> PathBuf {
     let item = &group.items[item_index];
     if !group.is_playlist {
@@ -208,6 +251,39 @@ pub fn unique_path(dir: &Path, title: &str, extension: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn location_quotes_and_spaces_are_removed() {
+        assert_eq!(clean_location("  \"C:\\Music\"  ").unwrap(), "C:\\Music");
+        assert_eq!(clean_location("'D:\\My Music'").unwrap(), "D:\\My Music");
+        assert_eq!(clean_location("   ").unwrap(), "");
+        assert_eq!(clean_location("\"\"").unwrap(), "");
+    }
+
+    #[test]
+    fn location_becomes_a_full_path() {
+        let full = clean_location("Music").unwrap();
+        assert!(Path::new(&full).is_absolute(), "{full}");
+        assert!(full.ends_with("\\Music"), "{full}");
+        assert_eq!(clean_location("C:/Music/Rock/../Pop").unwrap(), "C:\\Music\\Pop");
+        assert_eq!(clean_location("C:\\Music\\.\\Pop").unwrap(), "C:\\Music\\Pop");
+        assert_eq!(clean_location("\\\\server\\share\\Music").unwrap(), "\\\\server\\share\\Music");
+    }
+
+    #[test]
+    fn location_with_a_forbidden_character_explains_why() {
+        let err = clean_location("C:\\Mu|sic").unwrap_err();
+        assert!(err.contains("\"|\""), "{err}");
+        assert!(clean_location("C:\\\"Music").is_err());
+        assert!(clean_location("C:\\Music?").is_err());
+    }
+
+    #[test]
+    fn percent_in_the_folder_is_doubled_for_yt_dlp() {
+        assert_eq!(output_template(Path::new("C:\\100% Music"), "Song"), "C:\\100%% Music\\Song.%(ext)s");
+        assert_eq!(output_template(Path::new("C:\\a%(id)sb"), "Song (2)"), "C:\\a%%(id)sb\\Song (2).%(ext)s");
+        assert_eq!(output_template(Path::new("C:\\Music"), "Song"), "C:\\Music\\Song.%(ext)s");
+    }
     use crate::model::{Group, Item};
 
     fn item(title: &str, artists: &[&str]) -> Item {

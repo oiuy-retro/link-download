@@ -131,6 +131,13 @@ pub fn fetch(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg_dir: Pat
 
 pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: PathBuf, ffmpeg_dir: PathBuf, opts: Options, mut groups: Vec<Group>) {
     reset(&shared);
+    // The Location box already makes the folder a full path. This is a second
+    // guard: ffmpeg runs from the output folder, so a relative folder would be
+    // read twice over (Music\\Artist\\Music\\Artist\\...).
+    let mut opts = opts;
+    if let Ok(full) = paths::clean_location(&opts.location) {
+        opts.location = full;
+    }
     journal(&format!("download into {}", opts.location));
     let jobs = job_count(&groups);
     let (rows, already_bad) = rows_for(&groups);
@@ -187,7 +194,7 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 continue;
             }
             let stem = paths::download_stem(dir, &item.title);
-            let template = dir.join(format!("{stem}.%(ext)s")).display().to_string();
+            let template = paths::output_template(dir, &stem);
             let mut saved = String::new();
             let mut outcome = DownloadOutcome::Retry;
             while outcome == DownloadOutcome::Retry {
@@ -527,6 +534,7 @@ where
     command
         .args(args)
         .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

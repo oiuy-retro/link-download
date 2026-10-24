@@ -496,6 +496,9 @@ pub fn problems(opts: &Options) -> Vec<Problem> {
             codec: false,
         });
     }
+    if let Err(message) = crate::paths::clean_location(&opts.location) {
+        out.push(Problem { message, codec: false });
+    }
     if let Some(message) = codec_problem(opts) {
         out.push(Problem { message, codec: true });
     }
@@ -617,6 +620,18 @@ mod tests {
         options.location.clear();
         assert!(!can_advance(&options));
         assert!(problems(&options).is_empty());
+    }
+
+    #[test]
+    fn unusable_location_blocks_next_and_says_why() {
+        let mut options = opts();
+        options.location = "C:\\Mu|sic".into();
+        assert!(!can_advance(&options));
+        let found = problems(&options);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].message.contains("can't contain"), "{}", found[0].message);
+        options.reencode = true;
+        assert!(!can_advance(&options), "re-encoding must not hide a bad folder");
     }
 
     #[test]

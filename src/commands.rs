@@ -63,7 +63,7 @@ pub fn dump_args(node: &Path, ffmpeg_dir: &Path, url: &str) -> Vec<String> {
 
 pub fn update_args(node: &Path, ffmpeg_dir: &Path) -> Vec<String> {
     let mut args = tool_args(node, ffmpeg_dir);
-    args.push("-U".into());
+    args.extend(["--encoding".into(), "utf-8".into(), "-U".into()]);
     args
 }
 
