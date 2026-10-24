@@ -50,12 +50,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetClassNameW, GetCursorPos, GetScrollInfo, GA_ROOT, GetDlgItem, GetMessageW, GetParent, GetSystemMetrics, GetWindow,
     PostMessageW, WM_APP, IsChild, IsWindow,
     GetWindowLongPtrW, GetWindowRect, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadImageW,
-    MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW,
+    MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, BM_GETCHECK, BM_SETCHECK,
     CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, DI_NORMAL, EN_CHANGE, EN_KILLFOCUS, GW_CHILD, GW_HWNDNEXT, GWL_STYLE,
     GWLP_ID, GWLP_USERDATA, HMENU, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, HWND_TOP, IDC_ARROW, IMAGE_ICON, MB_ICONEXCLAMATION, MB_OK, MINMAXINFO, MSG,
+    HTTOPLEFT, HTTOPRIGHT, HWND_TOP, IDC_ARROW, IMAGE_ICON, MINMAXINFO, MSG,
     NCCALCSIZE_PARAMS, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXFRAME, SM_CXPADDEDBORDER,
     SM_CXSCREEN, SM_CYFRAME, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
@@ -153,6 +153,8 @@ enum Action {
     Pass,
     Result(isize),
     Popup(String),
+    /// A notice that is not a problem, shown with the information icon.
+    Notice(String),
     Browse,
     StartFetch,
     StartDownload,
@@ -619,6 +621,7 @@ fn run_action(action: Action) {
     match action {
         Action::None | Action::Pass | Action::Result(_) => {}
         Action::Popup(text) => popup(&text),
+        Action::Notice(text) => popup_as(&text, crate::popup::BoxIcon::Info),
         Action::Browse => browse(),
         Action::StartFetch => start_fetch(),
         Action::StartDownload => start_download(),
@@ -652,12 +655,13 @@ fn run_action(action: Action) {
 }
 
 fn popup(text: &str) {
-    let body = wide(text);
-    let title = wide("Link Download");
+    popup_as(text, crate::popup::BoxIcon::Warning);
+}
+
+fn popup_as(text: &str, icon: crate::popup::BoxIcon) {
     let hwnd = APP.with(|slot| slot.borrow().as_ref().map(|app| app.hwnd).unwrap_or_default());
-    unsafe {
-        MessageBoxW(hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONEXCLAMATION);
-    }
+    // A Windows 98 box drawn by the app. MessageBoxW gets the modern look on Windows 10 and 11.
+    crate::popup::message(hwnd, "Link Download", text, icon);
 }
 
 fn browse() {
@@ -684,7 +688,8 @@ fn start_fetch() {
     unsafe { let _ = UpdateWindow(hwnd); }
     match tools::load_bundle() {
         Err(err) => {
-            popup(&err);
+            // The tools next to the app are missing or broken, so nothing can be fetched.
+            popup_as(&err, crate::popup::BoxIcon::Error);
             APP.with(|slot| {
                 let mut borrow = slot.borrow_mut();
                 let app = borrow.as_mut().unwrap();
@@ -2709,7 +2714,7 @@ impl App {
                 self.rebuild();
                 if !notice.is_empty() && !self.told_update {
                     self.told_update = true;
-                    return Action::Popup(notice);
+                    return Action::Notice(notice);
                 }
             }
             Busy::Download => {
@@ -4267,7 +4272,7 @@ fn white_brush() -> HBRUSH {
     WHITE.get()
 }
 
-fn make_font(pt: i32, dpi: i32, bold: bool) -> HFONT {
+pub(crate) fn make_font(pt: i32, dpi: i32, bold: bool) -> HFONT {
     unsafe {
         CreateFontW(
             -((pt * dpi + 36) / 72),

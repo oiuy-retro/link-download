@@ -8,6 +8,7 @@ mod names;
 mod net;
 mod parse;
 mod paths;
+mod popup;
 mod readout;
 mod run;
 mod store;

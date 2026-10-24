@@ -236,7 +236,7 @@ pub fn is_button(hot: CapHot) -> bool {
     matches!(hot, CapHot::Min | CapHot::Max | CapHot::Close)
 }
 
-fn caption_fill(hdc: HDC, r: RECT, active: bool) {
+pub fn caption_fill(hdc: HDC, r: RECT, active: bool) {
     let (left, right) = if active {
         ((0x0A, 0x24, 0x6A), (0xA6, 0xCA, 0xF0))
     } else {
