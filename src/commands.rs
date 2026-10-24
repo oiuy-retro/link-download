@@ -186,9 +186,6 @@ pub fn download_args(opts: &Options, url: &str, playlist_item: Option<u32>, outp
         SAVED_PATH_PRINT.into(),
         // `--print` implies quiet, and quiet hides the progress bar unless this is set.
         "--progress".into(),
-        // Without this, progress updates are split by carriage returns, not line
-        // breaks, and the saved path is printed on the same line as the last one.
-        "--newline".into(),
     ]);
     if !opts.audio_only {
         args.push("--merge-output-format".into());
