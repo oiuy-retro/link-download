@@ -205,9 +205,11 @@ struct App {
     list_hwnd: HWND,
     list_scroll: i32,
     samples: VecDeque<(Instant, u64)>,
-    item_ticks: VecDeque<Instant>,
     sample_start: Instant,
     last_done: u32,
+    base_done: Option<u32>,
+    finished: u32,
+    last_finish: f64,
     told_update: bool,
     temp: PathBuf,
     started: Option<Instant>,
@@ -716,9 +718,11 @@ impl App {
             list_hwnd: null,
             list_scroll: 0,
             samples: VecDeque::new(),
-            item_ticks: VecDeque::new(),
             sample_start: Instant::now(),
             last_done: 0,
+            base_done: None,
+            finished: 0,
+            last_finish: 0.0,
             told_update: false,
             temp,
             started: None,
@@ -2455,9 +2459,11 @@ impl App {
 
     fn reset_speed(&mut self) {
         self.samples.clear();
-        self.item_ticks.clear();
         self.sample_start = Instant::now();
         self.last_done = 0;
+        self.base_done = None;
+        self.finished = 0;
+        self.last_finish = 0.0;
     }
 
     fn on_timer(&mut self) -> Action {
@@ -2530,16 +2536,17 @@ impl App {
         while self.samples.len() > 2 && now.saturating_duration_since(self.samples[0].0).as_millis() > 2000 {
             self.samples.pop_front();
         }
+        // Items pinned before the run starts count as done but took no time. Leave them out.
+        if live.total == 0 {
+            return;
+        }
         let done = live.ok.saturating_add(live.bad);
-        if done > self.last_done {
-            for _ in 0..(done - self.last_done) {
-                self.item_ticks.push_back(now);
-            }
-            self.last_done = done;
+        let base = *self.base_done.get_or_insert(done);
+        if done > self.last_done.max(base) {
+            self.finished = done - base;
+            self.last_finish = now.saturating_duration_since(self.sample_start).as_secs_f64();
         }
-        while self.item_ticks.front().is_some_and(|tick| now.saturating_duration_since(*tick).as_millis() > 2000) {
-            self.item_ticks.pop_front();
-        }
+        self.last_done = done;
     }
 
     fn paint_readouts(&self, live: &Live) {
@@ -2561,10 +2568,13 @@ impl App {
         }
         let (speed, items) = speed_of(self);
         let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count();
-        let eta = if items > 0.0 && left > 0 {
-            readout::format_eta(left as f64 / items)
-        } else if live.done || left == 0 {
+        let progress = live.rows.iter().find(|row| row.kind == RowKind::Active).map(|row| (row.fraction + row.convert) * 0.5);
+        let wait = if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 };
+        let estimate = readout::time_left(self.sample_start.elapsed().as_secs_f64(), self.finished, self.last_finish, left as u32, progress, wait);
+        let eta = if live.done || left == 0 {
             "—".to_string()
+        } else if let Some(seconds) = estimate {
+            readout::format_eta(seconds)
         } else {
             "Calculating...".to_string()
         };
@@ -2718,9 +2728,9 @@ fn speed_of(app: &App) -> (f64, f64) {
     } else {
         0.0
     };
+    // Whole run, waits included, so it agrees with Time left.
     let run = app.sample_start.elapsed().as_secs_f64().max(0.25);
-    let divisor = if run < 2.0 { run } else { 2.0 };
-    let items = app.item_ticks.len() as f64 / divisor;
+    let items = app.finished as f64 / run;
     (speed, items)
 }
 
