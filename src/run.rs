@@ -179,7 +179,11 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 continue;
             }
             let finished = paths::final_file(&dirs[index], &item.title, opts.container.extension());
-            if item.temp_path.is_none() && !claimed.contains(&finished) && finished.is_file() {
+            // A download from earlier in this session that still waits to be
+            // converted is used as before. After a successful save that file is
+            // gone, so pressing Download again finds the song already saved.
+            let waiting = item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false);
+            if !waiting && !claimed.contains(&finished) && finished.is_file() {
                 already_saved(&shared, row_id);
                 journal(&format!("already saved, skipped {}", finished.display()));
                 continue;
