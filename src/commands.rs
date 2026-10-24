@@ -9,6 +9,10 @@ use crate::model::{AudioCodec, AudioQuality, Container, Options, Resolution, Vid
 pub const PROGRESS_TEMPLATE: &str =
     "download:download:%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s";
 
+/// yt-dlp reads the first `after_move:` as when to print and leaves it out of the
+/// output, so it is written twice to keep the prefix `parse_after_move` looks for.
+pub const SAVED_PATH_PRINT: &str = "after_move:after_move:%(filepath)s";
+
 pub const SPONSORBLOCK_REMOVE: &str = "sponsor,selfpromo,interaction";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,7 +92,7 @@ pub fn download_args(opts: &Options, url: &str, playlist_item: Option<u32>, outp
         "--progress-template".into(),
         PROGRESS_TEMPLATE.into(),
         "--print".into(),
-        "after_move:%(filepath)s".into(),
+        SAVED_PATH_PRINT.into(),
         // `--print` implies quiet, and quiet hides the progress bar unless this is set.
         "--progress".into(),
     ]);
@@ -621,6 +625,9 @@ mod tests {
         assert_eq!(stripped.fraction, Some(0.375));
         assert_eq!(parse_progress("[download]  12.5% of 10.00MiB at 1.00MiB/s").unwrap().fraction, Some(0.125));
         assert_eq!(parse_after_move("after_move:C:\\Temp\\a.mkv").as_deref(), Some("C:\\Temp\\a.mkv"));
+        assert_eq!(parse_after_move("after_move:C:\\Music\\Song - Live (2020).mkv").as_deref(), Some("C:\\Music\\Song - Live (2020).mkv"));
+        assert_eq!(parse_after_move("C:\\Temp\\a.mkv"), None);
+        assert_eq!(parse_after_move("after_move:"), None);
         assert_eq!(parse_out_time_ms("out_time_ms=1500000"), Some(1_500_000));
     }
 
@@ -636,6 +643,9 @@ mod tests {
         );
         assert!(args.windows(2).any(|pair| pair[0] == "--progress-template" && pair[1] == PROGRESS_TEMPLATE));
         assert!(PROGRESS_TEMPLATE.starts_with("download:download:"));
+        assert!(args.windows(2).any(|pair| pair[0] == "--print" && pair[1] == SAVED_PATH_PRINT));
+        assert!(SAVED_PATH_PRINT.starts_with("after_move:after_move:"));
+        assert!(args.iter().any(|arg| arg == "--newline"));
         let print_at = args.iter().position(|arg| arg == "--print").unwrap();
         let progress_at = args.iter().position(|arg| arg == "--progress").unwrap();
         assert!(progress_at > print_at);
