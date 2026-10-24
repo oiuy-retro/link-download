@@ -45,7 +45,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
-    GetClassNameW, GetCursorPos, GetDlgItem, GetMessageW, GetParent, GetSystemMetrics, GetWindow,
+    GetAncestor, GetClassNameW, GetCursorPos, GetScrollInfo, GA_ROOT, GetDlgItem, GetMessageW, GetParent, GetSystemMetrics, GetWindow,
     GetWindowLongPtrW, GetWindowRect, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadImageW,
     MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, BM_GETCHECK, BM_SETCHECK,
@@ -123,6 +123,9 @@ thread_local! {
     static FACE: Cell<HBRUSH> = const { Cell::new(HBRUSH(std::ptr::null_mut())) };
     static WHITE: Cell<HBRUSH> = const { Cell::new(HBRUSH(std::ptr::null_mut())) };
     static WINDOW_BRUSH: Cell<HBRUSH> = const { Cell::new(HBRUSH(std::ptr::null_mut())) };
+    // Wheel movement smaller than one step, kept for the next message. Touchpads send small deltas.
+    static PAGE_WHEEL_REST: Cell<i32> = const { Cell::new(0) };
+    static WORK_WHEEL_REST: Cell<i32> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -501,8 +504,10 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
-            let delta = ((wparam.0 >> 16) as i16 as i32) / 120;
-            nudge_work(hwnd, -delta * 3);
+            let lines = take_wheel(&WORK_WHEEL_REST, wparam, 3);
+            if lines != 0 {
+                nudge_work(hwnd, -lines);
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -797,8 +802,10 @@ impl App {
                 Action::None
             }
             WM_MOUSEWHEEL => {
-                let delta = ((wparam.0 >> 16) as i16 as i32) / 120;
-                self.scroll_by(-delta * self.s(36));
+                let pixels = take_wheel(&PAGE_WHEEL_REST, wparam, self.s(36));
+                if pixels != 0 {
+                    self.scroll_by(-pixels);
+                }
                 Action::None
             }
             WM_CLOSE => Action::Close,
@@ -3065,6 +3072,9 @@ fn pick_folder(owner: HWND, current: &str) -> Option<String> {
     }
 }
 
+/// Sends the wheel to the control under the pointer when that control can still scroll
+/// that way, and to the page otherwise. A text box never keeps the wheel for nothing,
+/// and a closed drop-down never changes its value from a scroll.
 fn wheel(msg: &MSG) -> bool {
     if msg.message != WM_MOUSEWHEEL {
         return false;
@@ -3072,13 +3082,81 @@ fn wheel(msg: &MSG) -> bool {
     unsafe {
         let point = POINT { x: (msg.lParam.0 & 0xFFFF) as i16 as i32, y: ((msg.lParam.0 >> 16) & 0xFFFF) as i16 as i32 };
         let target = WindowFromPoint(point);
+        let up = wheel_delta(msg.wParam) > 0;
         let class = class_name(target);
-        if class == "Edit" || class == "ListBox" || class == "ComboLBox" || class == "LinkWorkList" || class == "SysListView32" {
+        let multiline = class == "Edit" && (GetWindowLongPtrW(target, GWL_STYLE) as u32) & 0x0004 != 0;
+        let can = !target.0.is_null() && bar_can_scroll(target, up);
+        if wheel_to_control(&class, multiline, can) {
             SendMessageW(target, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
             return true;
         }
+        let mut page = GetAncestor(target, GA_ROOT);
+        if class_name(page) != "LinkDownloadWindow" {
+            page = GetAncestor(msg.hwnd, GA_ROOT);
+        }
+        if class_name(page) != "LinkDownloadWindow" {
+            return false;
+        }
+        SendMessageW(page, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
     }
-    false
+    true
+}
+
+fn wheel_delta(wparam: WPARAM) -> i32 {
+    ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32
+}
+
+fn bar_can_scroll(hwnd: HWND, up: bool) -> bool {
+    let mut info = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+        ..Default::default()
+    };
+    if unsafe { GetScrollInfo(hwnd, SB_VERT, &mut info) }.is_err() {
+        return false;
+    }
+    can_scroll(info.nMin, info.nMax, info.nPage, info.nPos, up)
+}
+
+/// Whether a scroll bar at `pos` can still move toward the top (`up`) or toward the bottom.
+fn can_scroll(min: i32, max: i32, page: u32, pos: i32, up: bool) -> bool {
+    let last = (max - page.max(1) as i32 + 1).max(min);
+    if up { pos > min } else { pos < last }
+}
+
+/// True when the control under the pointer keeps the wheel. Everything else scrolls the page.
+fn wheel_to_control(class: &str, multiline: bool, can_scroll: bool) -> bool {
+    match class {
+        // An open drop-down list floats over the page, so the page stays still under it.
+        "ComboLBox" => true,
+        "ListBox" | "LinkWorkList" | "SysListView32" => can_scroll,
+        "Edit" => multiline && can_scroll,
+        _ => false,
+    }
+}
+
+fn take_wheel(rest: &'static std::thread::LocalKey<Cell<i32>>, wparam: WPARAM, per_notch: i32) -> i32 {
+    rest.with(|cell| {
+        let mut left = cell.get();
+        let steps = wheel_steps(&mut left, wheel_delta(wparam), per_notch);
+        cell.set(left);
+        steps
+    })
+}
+
+/// Turns a wheel delta into whole steps, `per_notch` steps for each 120. The part smaller
+/// than a step stays in `rest` for the next message. Positive means toward the top.
+fn wheel_steps(rest: &mut i32, delta: i32, per_notch: i32) -> i32 {
+    if delta == 0 {
+        return 0;
+    }
+    if (*rest > 0 && delta < 0) || (*rest < 0 && delta > 0) {
+        // The direction changed. What was left over belongs to the old direction.
+        *rest = 0;
+    }
+    let total = *rest + delta * per_notch;
+    *rest = total % 120;
+    total / 120
 }
 
 fn move_edited_line(dir: i32, tab: bool) -> bool {
@@ -3629,4 +3707,79 @@ fn make_font(pt: i32, dpi: i32, bold: bool) -> HFONT {
 
 fn font_bits(font: HFONT) -> usize {
     font.0 as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mouse_notch_moves_a_whole_step() {
+        let mut rest = 0;
+        assert_eq!(wheel_steps(&mut rest, 120, 36), 36);
+        assert_eq!(rest, 0);
+        assert_eq!(wheel_steps(&mut rest, -240, 3), -6);
+        assert_eq!(rest, 0);
+    }
+
+    #[test]
+    fn small_touchpad_deltas_add_up() {
+        let mut rest = 0;
+        let mut lines = 0;
+        for _ in 0..8 {
+            lines += wheel_steps(&mut rest, 15, 3);
+        }
+        // Eight deltas of 15 are one notch, so three lines in total.
+        assert_eq!(lines, 3);
+        assert_eq!(rest, 0);
+        let mut pixels = 0;
+        rest = 0;
+        for _ in 0..4 {
+            pixels += wheel_steps(&mut rest, -10, 36);
+        }
+        assert_eq!(pixels, -12);
+    }
+
+    #[test]
+    fn a_direction_change_drops_the_leftover() {
+        let mut rest = 0;
+        assert_eq!(wheel_steps(&mut rest, 30, 3), 0);
+        assert_eq!(rest, 90);
+        assert_eq!(wheel_steps(&mut rest, -30, 3), 0);
+        assert_eq!(rest, -90);
+        assert_eq!(wheel_steps(&mut rest, 0, 3), 0);
+        assert_eq!(rest, -90);
+    }
+
+    #[test]
+    fn scroll_limits_follow_the_bar() {
+        // Ten lines, four visible, so positions 0 to 6.
+        assert!(!can_scroll(0, 9, 4, 0, true));
+        assert!(can_scroll(0, 9, 4, 0, false));
+        assert!(can_scroll(0, 9, 4, 3, true));
+        assert!(can_scroll(0, 9, 4, 3, false));
+        assert!(can_scroll(0, 9, 4, 6, true));
+        assert!(!can_scroll(0, 9, 4, 6, false));
+        // Everything fits, so there is nowhere to go.
+        assert!(!can_scroll(0, 2, 4, 0, true));
+        assert!(!can_scroll(0, 2, 4, 0, false));
+        assert!(!can_scroll(0, 0, 0, 0, false));
+    }
+
+    #[test]
+    fn only_a_control_that_can_scroll_keeps_the_wheel() {
+        assert!(!wheel_to_control("Edit", false, true));
+        assert!(!wheel_to_control("Edit", false, false));
+        assert!(wheel_to_control("Edit", true, true));
+        assert!(!wheel_to_control("Edit", true, false));
+        assert!(!wheel_to_control("ComboBox", false, true));
+        assert!(wheel_to_control("ComboLBox", false, false));
+        for class in ["ListBox", "LinkWorkList", "SysListView32"] {
+            assert!(wheel_to_control(class, false, true));
+            assert!(!wheel_to_control(class, false, false));
+        }
+        for class in ["Static", "Button", "SysHeader32", "LinkDownloadHost", ""] {
+            assert!(!wheel_to_control(class, false, true));
+        }
+    }
 }
