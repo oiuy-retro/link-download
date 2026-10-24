@@ -38,8 +38,8 @@ use windows::Win32::UI::Controls::{
     TTTOOLINFOW, DRAWITEMSTRUCT, NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetFocus, VK_DOWN, VK_RETURN, VK_SHIFT,
-    VK_TAB, VK_UP,
+    EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DOWN,
+    VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     FileOpenDialog, IFileDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
@@ -3723,20 +3723,30 @@ fn shortcut(msg: &MSG) -> bool {
     if msg.message == WM_KEYDOWN {
         let key = msg.wParam.0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+        if !alt && edit_key(key, shift, ctrl) {
+            return true;
+        }
         let up = key == VK_UP.0 as usize;
         let down = key == VK_DOWN.0 as usize;
         let tab = key == VK_TAB.0 as usize;
-        if up || down || tab {
-            let dir = if up || (tab && shift) { -1 } else { 1 };
-            if move_edited_line(dir, tab) {
-                return true;
-            }
+        if tab && (ctrl || alt) {
+            // Ctrl+Tab is not a page tab here. Swallow it so a text box does not get a tab character.
+            return true;
+        }
+        // Shift or Ctrl with Up or Down belongs to the text box (select, or move the caret).
+        if (up || down) && !shift && !ctrl && !alt && move_edited_line(if up { -1 } else { 1 }, false) {
+            return true;
+        }
+        if tab && move_edited_line(if shift { -1 } else { 1 }, true) {
+            return true;
         }
         if tab {
             focus_next(shift);
             return true;
         }
-        if key == VK_RETURN.0 as usize {
+        if key == VK_RETURN.0 as usize && !ctrl && !alt {
             return activate_default();
         }
     }
@@ -3746,6 +3756,112 @@ fn shortcut(msg: &MSG) -> bool {
         return activate_mnemonic(ch);
     }
     false
+}
+
+/// The Remove, Insert and Find boxes of a Names or Titles tool row.
+fn is_tool_field(id: i32) -> bool {
+    (ID_REMOVE..ID_MODE).contains(&id) || (ID_FIND..ID_STRIP).contains(&id)
+}
+
+/// Keys the classic text box gets wrong or does not know. Returns true when handled.
+/// - Left and Right with a selection go to its start and its end, like current Windows.
+///   The classic box moves one character from the caret instead, so after Tab selected a
+///   whole name, both keys landed at the right.
+/// - Ctrl+A selects everything. The classic box ignores it.
+/// - Ctrl+Backspace deletes the word before the caret. The classic box types a box
+///   character instead. The deletion can be undone with Ctrl+Z.
+fn edit_key(key: usize, shift: bool, ctrl: bool) -> bool {
+    let focus = unsafe { GetFocus() };
+    if focus.0.is_null() || class_name(focus) != "Edit" {
+        return false;
+    }
+    let left = key == VK_LEFT.0 as usize;
+    let right = key == VK_RIGHT.0 as usize;
+    if (left || right) && !shift && !ctrl {
+        let (start, end) = edit_selection(focus);
+        if start == end {
+            return false;
+        }
+        let at = if left { start } else { end };
+        unsafe {
+            SendMessageW(focus, 0x00B1, WPARAM(at), LPARAM(at as isize));
+            // EM_SCROLLCARET
+            SendMessageW(focus, 0x00B7, WPARAM(0), LPARAM(0));
+        }
+        return true;
+    }
+    if key == b'A' as usize && ctrl && !shift {
+        unsafe { SendMessageW(focus, 0x00B1, WPARAM(0), LPARAM(-1)); }
+        return true;
+    }
+    if key == VK_BACK.0 as usize && ctrl {
+        let style = unsafe { GetWindowLongPtrW(focus, GWL_STYLE) as u32 };
+        if style & 0x0800 != 0 {
+            // ES_READONLY
+            return true;
+        }
+        let (start, end) = edit_selection(focus);
+        if start == end {
+            let text: Vec<u16> = get_text(focus).encode_utf16().collect();
+            let from = word_start_before(&text, end.min(text.len()));
+            if from == end {
+                return true;
+            }
+            unsafe { SendMessageW(focus, 0x00B1, WPARAM(from), LPARAM(end as isize)); }
+        }
+        let empty = [0u16; 1];
+        unsafe {
+            // EM_REPLACESEL with undo allowed.
+            SendMessageW(focus, 0x00C2, WPARAM(1), LPARAM(empty.as_ptr() as isize));
+        }
+        return true;
+    }
+    false
+}
+
+/// EM_GETSEL: start and end of the selection, in UTF-16 units.
+fn edit_selection(edit: HWND) -> (usize, usize) {
+    let mut start = 0u32;
+    let mut end = 0u32;
+    unsafe {
+        SendMessageW(edit, 0x00B0, WPARAM(&mut start as *mut u32 as usize), LPARAM(&mut end as *mut u32 as isize));
+    }
+    let (start, end) = (start as usize, end as usize);
+    (start.min(end), start.max(end))
+}
+
+/// Where Ctrl+Backspace starts deleting: spaces before the caret, then one run of word
+/// characters or one run of punctuation. A line break before the caret is deleted on its own.
+fn word_start_before(text: &[u16], caret: usize) -> usize {
+    let caret = caret.min(text.len());
+    let at = |i: usize| text[i];
+    let newline = |c: u16| c == b'\n' as u16 || c == b'\r' as u16;
+    let space = |c: u16| c == b' ' as u16 || c == b'\t' as u16 || c == 0x00A0 || c == 0x3000;
+    let word = |c: u16| {
+        if (0xD800..0xE000).contains(&c) {
+            return true;
+        }
+        char::from_u32(c as u32).map(|ch| ch.is_alphanumeric() || ch == '_' || ch == '\'').unwrap_or(true)
+    };
+    let mut i = caret;
+    if i > 0 && newline(at(i - 1)) {
+        i -= 1;
+        if at(i) == b'\n' as u16 && i > 0 && at(i - 1) == b'\r' as u16 {
+            i -= 1;
+        }
+        return i;
+    }
+    while i > 0 && space(at(i - 1)) {
+        i -= 1;
+    }
+    if i == 0 || newline(at(i - 1)) {
+        return i;
+    }
+    let kind = word(at(i - 1));
+    while i > 0 && !space(at(i - 1)) && !newline(at(i - 1)) && word(at(i - 1)) == kind {
+        i -= 1;
+    }
+    i
 }
 
 fn focus_next(shift: bool) {
@@ -3790,6 +3906,20 @@ fn focus_next(shift: bool) {
 fn activate_default() -> bool {
     let focus = unsafe { GetFocus() };
     let class = class_name(focus);
+    if class == "Edit" && is_tool_field(child_id(focus)) {
+        // Enter in Remove, Insert or Find applies that row, the same as its Apply button.
+        let parent = unsafe { GetParent(focus).unwrap_or(HWND(std::ptr::null_mut())) };
+        if let Ok(apply) = child(parent, ID_APPLY + group_of(child_id(focus)) as i32) {
+            if enabled_visible(apply) {
+                unsafe {
+                    SendMessageW(apply, 0x00F5, WPARAM(0), LPARAM(0));
+                    // A click moves focus to the button. Keep typing in the box instead.
+                    let _ = SetFocus(focus);
+                }
+            }
+        }
+        return true;
+    }
     if class == "Edit" {
         let style = unsafe { GetWindowLongPtrW(focus, GWL_STYLE) as u32 };
         if style & 0x1000 != 0 {
@@ -4261,5 +4391,56 @@ mod live_name_tests {
         LiveEdit::note(&mut slot, 0, 2, "Old name");
         assert_eq!(LiveEdit::cancel(&mut slot, 0, 3), None);
         assert_eq!(LiveEdit::cancel(&mut slot, 0, 2), None);
+    }
+}
+
+#[cfg(test)]
+mod text_key_tests {
+    use super::{is_tool_field, word_start_before, ID_FIND, ID_INSERT, ID_MODE, ID_REMOVE, ID_STRIP};
+
+    fn start(text: &str, caret: usize) -> usize {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        word_start_before(&wide, caret)
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_one_word() {
+        assert_eq!(start("hello world", 11), 6);
+        assert_eq!(start("hello world  ", 13), 6);
+        assert_eq!(start("hello", 5), 0);
+        assert_eq!(start("hello world", 8), 6);
+        assert_eq!(start("", 0), 0);
+        assert_eq!(start("   ", 3), 0);
+    }
+
+    #[test]
+    fn punctuation_is_its_own_word() {
+        assert_eq!(start("name?? ", 7), 4);
+        assert_eq!(start("Song - Artist", 6), 5);
+        assert_eq!(start("C:\\Music", 8), 3);
+        assert_eq!(start("don't", 5), 0);
+    }
+
+    #[test]
+    fn a_line_break_goes_by_itself() {
+        assert_eq!(start("one\r\ntwo", 5), 3);
+        assert_eq!(start("one\r\n", 5), 3);
+        assert_eq!(start("one\r\n  two", 10), 7);
+        assert_eq!(start("one\r\n  ", 7), 5);
+    }
+
+    #[test]
+    fn a_caret_past_the_end_is_clamped() {
+        assert_eq!(start("abc", 99), 0);
+    }
+
+    #[test]
+    fn only_remove_insert_and_find_apply_on_enter() {
+        assert!(is_tool_field(ID_REMOVE));
+        assert!(is_tool_field(ID_INSERT + 3));
+        assert!(is_tool_field(ID_FIND + 2));
+        assert!(!is_tool_field(ID_MODE));
+        assert!(!is_tool_field(ID_STRIP));
+        assert!(!is_tool_field(22000));
     }
 }
