@@ -41,10 +41,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     FileOpenDialog, IFileDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
-    SIGDN_FILESYSPATH,
+    SIGDN_FILESYSPATH, DefSubclassProc, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
+    CreateWindowExW, DefWindowProcW, GetAncestor, PostMessageW, GA_ROOT, WM_APP, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
     GetClassNameW, GetCursorPos, GetDlgItem, GetMessageW, GetParent, GetSystemMetrics, GetWindow,
     GetWindowLongPtrW, GetWindowRect, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadImageW,
     MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW,
@@ -114,6 +114,10 @@ const ID_TITLE_SAME_ALL: i32 = 21000;
 const ID_TITLE_FIELD: i32 = 22000;
 const ID_TITLE_SAME: i32 = 43000;
 const GROUP_LIMIT: usize = 1000;
+/// Posted by a Names list while its in-place editor is being typed in. WPARAM is the list.
+const WM_LIVE_NAME: u32 = WM_APP + 1;
+/// LVM_GETEDITCONTROL
+const LVM_GETEDITCONTROL: u32 = 0x1018;
 
 const PAGE_NAMES: [&str; 6] = ["Options", "Links", "Names", "Titles", "Metadata", "Download"];
 
@@ -235,6 +239,35 @@ struct App {
     active: bool,
     cap_hot: CapHot,
     cap_press: CapHot,
+    /// The file name being typed in a Names list, and what it was before typing started.
+    live_edit: Option<LiveEdit>,
+}
+
+/// One file name being edited in place. `original` is put back when the edit is cancelled with Esc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveEdit {
+    group: usize,
+    index: usize,
+    original: String,
+}
+
+impl LiveEdit {
+    /// Remembers the name before the first keystroke of an edit. Later keystrokes in the
+    /// same row keep the first original. A different row starts a new edit.
+    fn note(slot: &mut Option<LiveEdit>, group: usize, index: usize, committed: &str) {
+        match slot {
+            Some(edit) if edit.group == group && edit.index == index => {}
+            _ => *slot = Some(LiveEdit { group, index, original: committed.to_string() }),
+        }
+    }
+
+    /// The name to put back when the edit of this row is cancelled, if it was typed in.
+    fn cancel(slot: &mut Option<LiveEdit>, group: usize, index: usize) -> Option<String> {
+        match slot.take() {
+            Some(edit) if edit.group == group && edit.index == index => Some(edit.original),
+            _ => None,
+        }
+    }
 }
 
 pub fn run() -> i32 {
@@ -509,6 +542,19 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     }
 }
 
+/// Subclass of each Names list. Its in-place editor sends EN_CHANGE to the list, which
+/// ignores it. Post it to the main window instead. Posting, not sending, because the
+/// editor can change while the app is in the middle of handling a click.
+unsafe extern "system" fn name_list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    if msg == WM_COMMAND && ((wparam.0 >> 16) & 0xFFFF) as u32 == EN_CHANGE {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        if !root.0.is_null() {
+            let _ = PostMessageW(root, WM_LIVE_NAME, WPARAM(hwnd.0 as usize), LPARAM(0));
+        }
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
 fn paint_control(msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         let hdc = HDC(wparam.0 as *mut _);
@@ -746,6 +792,7 @@ impl App {
             active: true,
             cap_hot: CapHot::None,
             cap_press: CapHot::None,
+            live_edit: None,
         }
     }
 
@@ -799,6 +846,10 @@ impl App {
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) as i16 as i32) / 120;
                 self.scroll_by(-delta * self.s(36));
+                Action::None
+            }
+            x if x == WM_LIVE_NAME => {
+                self.live_name(HWND(wparam.0 as *mut _));
                 Action::None
             }
             WM_CLOSE => Action::Close,
@@ -1082,6 +1133,7 @@ impl App {
 
     fn rebuild(&mut self) {
         self.harvest_soft();
+        self.live_edit = None;
         self.clear_kids();
         self.scroll = 0;
         self.list_scroll = 0;
@@ -1482,7 +1534,12 @@ impl App {
         // WS_CLIPCHILDREN keeps the in-place editor above the row text. Without it the row paints through the editor.
         // LVS_REPORT | LVS_EDITLABELS | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER
         let bits = 0x40000000 | 0x10000000 | 0x10000 | 0x02000000 | 0x00800000 | 0x0001 | 0x0200 | 0x0004 | 0x0008 | 0x8000;
-        self.make(self.host, "SysListView32", "", bits, 0x200, x, y, w, h, id, 0)
+        let list = self.make(self.host, "SysListView32", "", bits, 0x200, x, y, w, h, id, 0);
+        if (ID_LIST..ID_ALBUM).contains(&id) {
+            // The in-place editor reports each change to the list, not to us. Listen there.
+            unsafe { let _ = SetWindowSubclass(list, Some(name_list_proc), 1, 0); }
+        }
+        list
     }
 
     fn make(&mut self, parent: HWND, class: &str, text: &str, style: u32, ex: u32, x: i32, y: i32, w: i32, h: i32, id: i32, _tab: i32) -> HWND {
@@ -1870,6 +1927,39 @@ impl App {
         Action::None
     }
 
+    /// A key was typed in a Names list editor. The name, the warning line, and Next follow it
+    /// right away. Nothing is written back into the editor, so the caret and undo are untouched.
+    fn live_name(&mut self, list: HWND) {
+        if self.page != 2 || list.0.is_null() {
+            return;
+        }
+        let id = child_id(list);
+        if !(ID_LIST..ID_ALBUM).contains(&id) {
+            return;
+        }
+        let edit = unsafe { HWND(SendMessageW(list, LVM_GETEDITCONTROL, WPARAM(0), LPARAM(0)).0 as *mut _) };
+        if edit.0.is_null() {
+            // The edit already ended. Its end notice did the work.
+            return;
+        }
+        let index = list_focus_index(list);
+        if index < 0 {
+            return;
+        }
+        let group = (id - ID_LIST) as usize;
+        let index = index as usize;
+        let text = get_text(edit);
+        let Some(item) = self.groups.get_mut(group).and_then(|group| group.items.get_mut(index)) else {
+            return;
+        };
+        LiveEdit::note(&mut self.live_edit, group, index, &item.title);
+        if item.title == text {
+            return;
+        }
+        item.title = text;
+        self.refresh_nav();
+    }
+
     fn on_notify(&mut self, lparam: LPARAM) -> Action {
         unsafe {
             let header = &*(lparam.0 as *const NMHDR);
@@ -1885,11 +1975,23 @@ impl App {
             }
             if header.code == LVN_ENDLABELEDITW {
                 let info = &*(lparam.0 as *const NMLVDISPINFOW);
+                let id = child_id(header.hwndFrom);
                 if info.item.pszText.0.is_null() {
+                    // Esc: the list keeps its old text. Put the model back to match it.
+                    if (ID_LIST..ID_ALBUM).contains(&id) && info.item.iItem >= 0 {
+                        let group = (id - ID_LIST) as usize;
+                        let index = info.item.iItem as usize;
+                        if let Some(original) = LiveEdit::cancel(&mut self.live_edit, group, index) {
+                            if let Some(item) = self.groups.get_mut(group).and_then(|group| group.items.get_mut(index)) {
+                                item.title = original;
+                            }
+                            self.refresh_nav();
+                        }
+                    }
                     return Action::Result(0);
                 }
+                self.live_edit = None;
                 let title = pw_string(info.item.pszText);
-                let id = child_id(header.hwndFrom);
                 if (ID_LIST..ID_ALBUM).contains(&id) {
                     let group = (id - ID_LIST) as usize;
                     if let Some(item) = self.groups.get_mut(group).and_then(|group| group.items.get_mut(info.item.iItem as usize)) {
@@ -3629,4 +3731,42 @@ fn make_font(pt: i32, dpi: i32, bold: bool) -> HFONT {
 
 fn font_bits(font: HFONT) -> usize {
     font.0 as usize
+}
+
+#[cfg(test)]
+mod live_name_tests {
+    use super::LiveEdit;
+
+    #[test]
+    fn the_first_keystroke_keeps_the_old_name() {
+        let mut slot = None;
+        LiveEdit::note(&mut slot, 0, 2, "Old name");
+        LiveEdit::note(&mut slot, 0, 2, "Old nam");
+        assert_eq!(slot, Some(LiveEdit { group: 0, index: 2, original: "Old name".into() }));
+    }
+
+    #[test]
+    fn another_row_starts_a_new_edit() {
+        let mut slot = None;
+        LiveEdit::note(&mut slot, 0, 2, "First");
+        LiveEdit::note(&mut slot, 1, 0, "Second");
+        assert_eq!(slot, Some(LiveEdit { group: 1, index: 0, original: "Second".into() }));
+    }
+
+    #[test]
+    fn esc_gives_back_the_old_name_once() {
+        let mut slot = None;
+        LiveEdit::note(&mut slot, 0, 2, "Old name");
+        assert_eq!(LiveEdit::cancel(&mut slot, 0, 2), Some("Old name".into()));
+        assert_eq!(slot, None);
+        assert_eq!(LiveEdit::cancel(&mut slot, 0, 2), None);
+    }
+
+    #[test]
+    fn esc_on_a_row_that_was_not_typed_in_changes_nothing() {
+        let mut slot = None;
+        LiveEdit::note(&mut slot, 0, 2, "Old name");
+        assert_eq!(LiveEdit::cancel(&mut slot, 0, 3), None);
+        assert_eq!(LiveEdit::cancel(&mut slot, 0, 2), None);
+    }
 }
