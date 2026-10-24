@@ -825,6 +825,32 @@ pub fn kill_child(shared: &Shared) {
 mod tests {
     use super::*;
 
+    fn lines_of(bytes: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        read_lines(bytes, |line| lines.push(line));
+        lines
+    }
+
+    #[test]
+    fn saved_path_is_read_from_its_own_line() {
+        // What yt-dlp writes with `--newline` and the saved-path print.
+        let out = b"download:downloading|1024|185292|NA|NA\ndownload:finished|185292|185292|NA|2659031.1\nafter_move:C:\\Music\\Me at the zoo - (test).mkv\r\n";
+        let lines = lines_of(out);
+        assert_eq!(lines.len(), 3);
+        assert!(commands::parse_progress(&lines[1]).is_some());
+        let found: Vec<String> = lines.iter().filter_map(|line| commands::parse_after_move(line)).collect();
+        assert_eq!(found, vec!["C:\\Music\\Me at the zoo - (test).mkv".to_string()]);
+    }
+
+    #[test]
+    fn without_newline_the_saved_path_shares_a_line() {
+        // What yt-dlp writes without `--newline`: one line, updates split by `\r` and an erase code.
+        let out = b"\r\x1b[Kdownload:downloading|1024|185292|NA|NA\r\x1b[Kdownload:finished|185292|185292|NA|NA\r\x1b[Kafter_move:C:\\a.mkv\n";
+        let lines = lines_of(out);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(commands::parse_after_move(&lines[0]), None);
+    }
+
     fn out(code: i32, stdout: &str, log: &str) -> RunOut {
         RunOut {
             code,
