@@ -779,9 +779,20 @@ fn push_log(log: &Mutex<String>, line: &str) {
     let mut text = log.lock().expect("log");
     text.push_str(line);
     text.push('\n');
+    trim_log(&mut text);
+}
+
+/// Keeps only the last part of a long log. The cut is a byte position, so it
+/// is moved forward to the start of the next character. Slicing a `String`
+/// in the middle of a character (for example a Japanese title or an emoji)
+/// would panic, and with `panic = "abort"` that closes the whole app.
+fn trim_log(text: &mut String) {
     if text.len() > 64_000 {
-        let cut = text.len() - 48_000;
-        *text = text[cut..].to_string();
+        let mut cut = text.len() - 48_000;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text.drain(..cut);
     }
 }
 
@@ -1137,6 +1148,37 @@ mod tests {
         assert_eq!(live.ok, 1);
         assert_eq!(live.rows[0].kind, RowKind::Saved);
         assert_eq!(live.rows[0].note, "Already saved");
+    }
+
+    #[test]
+    fn trimming_a_long_log_never_splits_a_character() {
+        // The cut point moves with the padding, so some of these runs put it
+        // inside a three-byte Japanese character or a four-byte emoji.
+        for pad in 0..60 {
+            let log = Mutex::new(String::new());
+            push_log(&log, &"a".repeat(15_999 + pad));
+            push_log(&log, &"日本語のタイトル 🎵".repeat(10));
+            push_log(&log, &"b".repeat(pad));
+            for _ in 0..2000 {
+                push_log(&log, "download:downloading|1000|125000|NA|5000");
+            }
+            let text = log.lock().unwrap();
+            assert!(text.len() <= 64_000, "pad {pad}: {} bytes", text.len());
+            assert!(text.ends_with("download:downloading|1000|125000|NA|5000\n"));
+        }
+    }
+
+    #[test]
+    fn trim_log_keeps_the_end_and_starts_on_a_whole_character() {
+        let mut text = String::new();
+        while text.len() <= 64_000 {
+            text.push_str("曲");
+        }
+        text.push_str("end");
+        trim_log(&mut text);
+        assert!(text.len() <= 48_000);
+        assert!(text.starts_with('曲'));
+        assert!(text.ends_with("end"));
     }
 
     fn out(code: i32, stdout: &str, log: &str) -> RunOut {
