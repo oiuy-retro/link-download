@@ -200,6 +200,9 @@ struct App {
     node: PathBuf,
     shared: Option<std::sync::Arc<Shared>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Cancel was pressed and the worker is still winding down. The window
+    /// keeps working meanwhile; `poll_work` finishes the cancel when it is done.
+    stopping: bool,
     busy: Busy,
     rows: Vec<WorkRow>,
     list_hwnd: HWND,
@@ -640,23 +643,22 @@ fn start_download() {
     });
 }
 
+/// Cancel: stops the running programs and returns at once. It used to wait here,
+/// on the window's own thread, for the worker to finish, which froze the window.
+/// Now the 100 ms timer (`poll_work`) notices when the worker has stopped and
+/// then goes back a page, as before.
 fn cancel_work() {
-    let (shared, worker) = APP.with(|slot| {
-        let mut borrow = slot.borrow_mut();
-        let app = borrow.as_mut().unwrap();
-        if let Some(shared) = &app.shared {
-            run::kill_child(shared);
-        }
-        (app.shared.clone(), app.worker.take())
-    });
-    if let Some(worker) = worker {
-        let _ = worker.join();
-    }
-    let _ = shared;
     APP.with(|slot| {
         let mut borrow = slot.borrow_mut();
         let app = borrow.as_mut().unwrap();
-        app.after_cancel();
+        if app.stopping {
+            return;
+        }
+        if let Some(shared) = &app.shared {
+            run::kill_child(shared);
+        }
+        app.stopping = true;
+        app.refresh_nav();
     });
 }
 
@@ -711,6 +713,7 @@ impl App {
             node: PathBuf::new(),
             shared: None,
             worker: None,
+            stopping: false,
             busy: Busy::Idle,
             rows: Vec::new(),
             list_hwnd: null,
@@ -1708,11 +1711,13 @@ impl App {
 
     fn refresh_nav(&mut self) {
         let ready = self.page_ready();
-        set_enabled(self.back, self.page > 0);
-        set_enabled(self.next, ready);
+        set_enabled(self.back, self.page > 0 && !self.stopping);
+        set_enabled(self.next, ready && !self.stopping);
         let caption = if self.page == 5 { "&Finish" } else { "Next >" };
         set_text(self.next, caption);
-        let title = if self.busy != Busy::Idle {
+        let title = if self.stopping {
+            "Link Download - Stopping".into()
+        } else if self.busy != Busy::Idle {
             let left = self.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count();
             if left > 0 {
                 format!("Link Download - {left} left")
@@ -2472,6 +2477,18 @@ impl App {
     }
 
     fn poll_work(&mut self) -> Action {
+        if self.stopping {
+            let finished = self.worker.as_ref().map(|worker| worker.is_finished()).unwrap_or(true);
+            if !finished {
+                return Action::None;
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            self.stopping = false;
+            self.after_cancel();
+            return Action::None;
+        }
         let Some(shared) = self.shared.clone() else {
             return Action::None;
         };

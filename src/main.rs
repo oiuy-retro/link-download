@@ -4,6 +4,7 @@ mod classify;
 mod classic;
 mod commands;
 mod model;
+mod jobs;
 mod names;
 mod net;
 mod parse;
