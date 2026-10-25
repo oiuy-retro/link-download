@@ -227,6 +227,10 @@ pub fn download_stem(dir: &Path, title: &str) -> String {
     format!("{base} copy")
 }
 
+/// The hidden folder where unfinished downloads are kept (see fix/cancel). It is
+/// never a song, so name checks and the download search skip it.
+pub const PARTIAL_DIR: &str = ".link-download-partial";
+
 fn stem_used(dir: &Path, stem: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;

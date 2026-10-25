@@ -15,6 +15,7 @@ use crate::commands::{self, Tags};
 use crate::jobs::Running;
 use crate::model::{Block, Group, Options};
 use crate::net;
+use crate::partial;
 use crate::paths;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -187,11 +188,12 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 journal(&format!("could not create {}: {err}", dir.display()));
                 continue;
             }
-            // yt-dlp downloads into the app's own temp folder, one folder per item.
-            // Only the finished, tagged file is moved into the music folder, so a
-            // Cancel never leaves .part, .ytdl or .f137 pieces next to your music.
-            let work = item_work_dir(row_id);
-            if let Err(err) = fs::create_dir_all(&work) {
+            // yt-dlp downloads into a hidden folder inside the music folder, one
+            // folder per item (see partial.rs). Only the finished, tagged file is
+            // moved next to your music, so a Cancel never leaves .part, .ytdl or
+            // .f137 pieces there, and the move is a rename on the same drive.
+            let work = partial::item_dir(Path::new(&opts.location), row_id);
+            if let Err(err) = partial::prepare(Path::new(&opts.location)).and_then(|_| fs::create_dir_all(&work)) {
                 fail(&shared, row_id, &err.to_string());
                 journal(&format!("could not create {}: {err}", work.display()));
                 continue;
@@ -349,7 +351,7 @@ fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, 
         Ok(_) => {}
     }
     set_convert(shared, row_id, 0.8);
-    let thumb = thumbnail_jpeg(shared, ffmpeg, &item_work_dir(row_id), &own_thumb, row_id);
+    let thumb = thumbnail_jpeg(shared, ffmpeg, &partial::item_dir(Path::new(&opts.location), row_id), &own_thumb, row_id);
     let mut ready = tagged.clone();
     if let Some(ref thumb) = thumb {
         let cover = commands::cover_args(&tagged, thumb, &covered, opts.container, opts.audio_only);
@@ -391,8 +393,8 @@ fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, 
     if ready.as_path() != destination.as_path() && ready != tagged {
         let _ = fs::remove_file(&ready);
     }
-    // The item's temp folder held only the download and the cover picture.
-    let work = item_work_dir(row_id);
+    // The item's folder in the hidden folder held only the download and the cover picture.
+    let work = partial::item_dir(Path::new(&opts.location), row_id);
     if source.starts_with(&work) {
         let _ = fs::remove_dir_all(&work);
     }
@@ -771,9 +773,9 @@ fn reset(shared: &Shared) {
 }
 
 fn finish(shared: &Shared, groups: Vec<Group>, error: &str) {
-    if cancelled(shared) {
-        discard_unfinished(&groups);
-    }
+    // This run's part of the hidden folder is removed, except finished downloads
+    // that still wait to be converted.
+    partial::clean_up(&waiting_files(&groups));
     *shared.groups.lock().expect("groups") = Some(groups);
     let mut live = shared.live.lock().expect("live");
     live.current_bytes = 0;
@@ -788,38 +790,21 @@ fn finish(shared: &Shared, groups: Vec<Group>, error: &str) {
     live.done = true;
 }
 
-/// The app's own temp folder for this run of the app. The window removes it when
-/// the app closes.
-fn work_root() -> PathBuf {
-    std::env::temp_dir().join("Link Download").join(std::process::id().to_string())
-}
-
-/// The private folder yt-dlp downloads one item into.
-fn item_work_dir(row_id: u64) -> PathBuf {
-    work_root().join(format!("item-{row_id}"))
-}
-
-/// After a Cancel, removes the item folders the app made in its own temp folder,
-/// except ones holding a finished download that is still waiting to be converted
-/// (that file is reused if you press Download again). Nothing outside the app's
-/// temp folder is touched.
-fn discard_unfinished(groups: &[Group]) {
-    let keep: Vec<PathBuf> = groups
+/// Finished downloads that still wait to be converted. Pressing Download again
+/// uses them, so their folders are kept.
+fn waiting_files(groups: &[Group]) -> Vec<PathBuf> {
+    groups
         .iter()
         .flat_map(|group| group.items.iter())
         .filter_map(|item| item.temp_path.as_ref())
-        .filter_map(|path| Path::new(path).parent().map(Path::to_path_buf))
-        .collect();
-    let Ok(entries) = fs::read_dir(work_root()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ours = entry.file_name().to_string_lossy().starts_with("item-");
-        if ours && path.is_dir() && !keep.contains(&path) {
-            let _ = fs::remove_dir_all(&path);
-        }
-    }
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// When the app closes, its folders in the hidden folder are removed completely.
+pub fn discard_partial() {
+    partial::discard_all();
 }
 
 fn set_status(shared: &Shared, text: &str) {
@@ -1005,50 +990,6 @@ mod tests {
         let result = run_command(&shared, Path::new("cmd.exe"), &args, None, false, |_| {});
         assert_eq!(result.err().as_deref(), Some("Stopped."));
         assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn after_cancel_only_unfinished_item_folders_in_the_app_temp_are_removed() {
-        let root = work_root();
-        let keep = item_work_dir(9_000_001);
-        let drop_me = item_work_dir(9_000_002);
-        let other = root.join("not-an-item");
-        for dir in [&keep, &drop_me, &other] {
-            fs::create_dir_all(dir).unwrap();
-        }
-        fs::write(keep.join("Song.mkv"), b"done").unwrap();
-        fs::write(drop_me.join("Song.f137.mp4.part"), b"half").unwrap();
-        let item = crate::model::Item {
-            id: "x".into(),
-            title: "Song".into(),
-            meta_title: "Song".into(),
-            original_title: "Song".into(),
-            original_artists: Vec::new(),
-            artists: Vec::new(),
-            download_url: String::new(),
-            playlist_item: None,
-            track_number: None,
-            duration: 0.0,
-            thumbnail: String::new(),
-            temp_path: Some(keep.join("Song.mkv").display().to_string()),
-            blocked: None,
-        };
-        let group = Group {
-            source_url: String::new(),
-            is_playlist: false,
-            playlist_title: String::new(),
-            album: String::new(),
-            original_album: String::new(),
-            playlist_thumbnail: String::new(),
-            error: String::new(),
-            items: vec![item],
-        };
-        discard_unfinished(&[group]);
-        assert!(keep.join("Song.mkv").is_file());
-        assert!(!drop_me.exists());
-        assert!(other.exists(), "only item- folders are the app's to remove");
-        let _ = fs::remove_dir_all(&keep);
-        let _ = fs::remove_dir_all(&other);
     }
 
     fn out(code: i32, stdout: &str, log: &str) -> RunOut {

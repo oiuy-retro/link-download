@@ -2844,6 +2844,7 @@ impl App {
             let _ = worker.join();
         }
         self.harvest();
+        run::discard_partial();
         self.memory.last_profile = self.active_profile.clone();
         store::save(&self.memory);
         let _ = std::fs::remove_dir_all(&self.temp);
