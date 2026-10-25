@@ -1932,6 +1932,11 @@ impl App {
                     }
                     return Action::Popup(text);
                 }
+                // Checked here rather than while typing, so a half-typed path
+                // (for example one that starts with a quote) never pops up a message.
+                if let Err(text) = crate::paths::clean_location(&get_text(self.location_hwnd)) {
+                    return Action::Popup(text);
+                }
                 match tools::load_bundle() {
                     Ok(bundle) => self.store_bundle(bundle),
                     Err(err) => return Action::Popup(err),
