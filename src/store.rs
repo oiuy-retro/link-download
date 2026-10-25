@@ -112,6 +112,7 @@ fn options_to_json(opts: &Options) -> Value {
         "reencode": opts.reencode,
         "sponsorblock": opts.sponsorblock,
         "strip_genre": opts.strip_genre,
+        "overwrite": opts.overwrite,
         "min_wait": opts.min_wait,
         "max_wait": opts.max_wait,
         "location": opts.location,
@@ -129,6 +130,7 @@ fn options_from(value: &Value) -> Options {
         reencode: value.get("reencode").and_then(Value::as_bool).unwrap_or(false),
         sponsorblock: value.get("sponsorblock").and_then(Value::as_bool).unwrap_or(false),
         strip_genre: value.get("strip_genre").and_then(Value::as_bool).unwrap_or(true),
+        overwrite: value.get("overwrite").and_then(Value::as_bool).unwrap_or(false),
         min_wait: value.get("min_wait").and_then(Value::as_u64).unwrap_or(4) as u32,
         max_wait: value.get("max_wait").and_then(Value::as_u64).unwrap_or(8) as u32,
         location: text_at(value, "location"),
@@ -155,6 +157,7 @@ mod tests {
         memory.profiles[0].options.container = Container::M4a;
         memory.profiles[0].options.sponsorblock = true;
         memory.profiles[0].options.strip_genre = false;
+        memory.profiles[0].options.overwrite = true;
         memory.last_profile = "Default".into();
         memory.override_profile = "Default".into();
         memory.override_location = "D:\\Incoming".into();
@@ -171,6 +174,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(loaded, memory);
         assert!(!loaded.profiles[0].options.strip_genre);
+        assert!(loaded.profiles[0].options.overwrite);
     }
 
     #[test]
@@ -178,5 +182,6 @@ mod tests {
         let opts = options_from(&json!({ "location": "C:\\Music" }));
         assert!(opts.strip_genre);
         assert!(!opts.sponsorblock);
+        assert!(!opts.overwrite, "settings saved before this option existed keep it off");
     }
 }

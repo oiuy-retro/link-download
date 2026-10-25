@@ -177,12 +177,19 @@ pub fn download_stem(dir: &Path, title: &str) -> String {
     format!("{base} copy")
 }
 
+/// The hidden folder where unfinished downloads are kept (see fix/cancel). It is
+/// never a song, so name checks and the download search skip it.
+pub const PARTIAL_DIR: &str = ".link-download-partial";
+
 fn stem_used(dir: &Path, stem: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     entries.flatten().any(|entry| {
         let name = entry.file_name().to_string_lossy().to_string();
+        if name == PARTIAL_DIR {
+            return false;
+        }
         match name.strip_prefix(stem) {
             Some(rest) => rest.is_empty() || (rest.starts_with('.') && !is_ytdlp_leftover(&rest[1..])),
             None => false,
@@ -270,7 +277,9 @@ mod tests {
         for name in ["Song.f137.mp4.part", "Song.f140.m4a", "Song.mkv.ytdl", "Song.temp.mkv", "Song.mkv.part"] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
+        std::fs::create_dir_all(dir.join(PARTIAL_DIR).join("1234")).unwrap();
         assert_eq!(download_stem(&dir, "Song"), "Song");
+        assert_eq!(download_stem(&dir, ".link-download-partial"), ".link-download-partial");
         std::fs::write(dir.join("Song.mkv"), b"x").unwrap();
         assert_eq!(download_stem(&dir, "Song"), "Song (2)");
         let _ = std::fs::remove_dir_all(&dir);

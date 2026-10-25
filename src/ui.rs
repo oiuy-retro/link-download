@@ -88,6 +88,7 @@ const ID_AUDIO: i32 = 18;
 const ID_REENCODE: i32 = 19;
 const ID_SPONSORBLOCK: i32 = 24;
 const ID_STRIP_GENRE: i32 = 25;
+const ID_OVERWRITE: i32 = 26;
 const ID_MIN: i32 = 20;
 const ID_MAX: i32 = 21;
 const ID_LOCATION: i32 = 22;
@@ -227,6 +228,7 @@ struct App {
     audio_hwnd: HWND,
     reencode_hwnd: HWND,
     sponsorblock_hwnd: HWND,
+    overwrite_hwnd: HWND,
     strip_genre_hwnd: HWND,
     min_hwnd: HWND,
     max_hwnd: HWND,
@@ -738,6 +740,7 @@ impl App {
             audio_hwnd: null,
             reencode_hwnd: null,
             sponsorblock_hwnd: null,
+            overwrite_hwnd: null,
             strip_genre_hwnd: null,
             min_hwnd: null,
             max_hwnd: null,
@@ -1139,6 +1142,8 @@ impl App {
         self.reencode_hwnd = self.check(x, y, self.s(220), "Re-&encode", ID_REENCODE, self.options.reencode);
         y += self.s(24);
         self.sponsorblock_hwnd = self.check(x, y, self.s(220), "Sponsor&Block", ID_SPONSORBLOCK, self.options.sponsorblock);
+        y += self.s(24);
+        self.overwrite_hwnd = self.check(x, y, self.s(280), "Overwrite files &already saved", ID_OVERWRITE, self.options.overwrite);
         y += self.s(32);
         self.label(x, y + self.s(3), label_w, "&Minimum");
         self.min_hwnd = self.edit(field_x, y, self.s(48), ID_MIN, false, true);
@@ -1818,7 +1823,7 @@ impl App {
                 self.options.container = container_after_toggle(&self.options);
                 self.refill_containers();
             }
-            if matches!(id, ID_RES | ID_VCODEC | ID_AQUAL | ID_ACODEC | ID_CONTAINER | ID_AUDIO | ID_REENCODE | ID_SPONSORBLOCK | ID_STRIP_GENRE | ID_MIN | ID_MAX | ID_LOCATION) {
+            if matches!(id, ID_RES | ID_VCODEC | ID_AQUAL | ID_ACODEC | ID_CONTAINER | ID_AUDIO | ID_REENCODE | ID_SPONSORBLOCK | ID_STRIP_GENRE | ID_OVERWRITE | ID_MIN | ID_MAX | ID_LOCATION) {
                 self.note_options(true);
             }
         }
@@ -2069,6 +2074,7 @@ impl App {
             audio_only: checked(self.audio_hwnd),
             reencode: checked(self.reencode_hwnd),
             sponsorblock: checked(self.sponsorblock_hwnd),
+            overwrite: checked(self.overwrite_hwnd),
             strip_genre: checked(self.strip_genre_hwnd),
             min_wait: parse_u32(&get_text(self.min_hwnd), 4),
             max_wait: parse_u32(&get_text(self.max_hwnd), 8),
@@ -2647,6 +2653,7 @@ impl App {
                 (self.audio_hwnd, "Download sound only"),
                 (self.reencode_hwnd, "Convert when a copy will not fit"),
                 (self.sponsorblock_hwnd, "Cut sponsors, self-promotion, and interaction reminders"),
+                (self.overwrite_hwnd, "Download songs again and replace files that are already saved"),
                 (self.min_hwnd, "Shortest pause between downloads"),
                 (self.max_hwnd, "Longest pause between downloads"),
                 (self.location_hwnd, "Folder for finished files"),
