@@ -78,6 +78,9 @@ pub struct Options {
     pub sponsorblock: bool,
     /// Drop yt-dlp's automatic genre tag and the video description.
     pub strip_genre: bool,
+    /// Download a song again even when its finished file is already in the
+    /// folder, and replace that file once the new one is done. Off by default.
+    pub overwrite: bool,
     pub min_wait: u32,
     pub max_wait: u32,
     pub location: String,
@@ -140,6 +143,7 @@ impl Default for Options {
             reencode: false,
             sponsorblock: false,
             strip_genre: true,
+            overwrite: false,
             min_wait: 4,
             max_wait: 8,
             location: String::new(),

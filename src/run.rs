@@ -183,7 +183,12 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             // converted is used as before. After a successful save that file is
             // gone, so pressing Download again finds the song already saved.
             let waiting = item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false);
-            if !waiting && !claimed.contains(&finished) && finished.is_file() {
+            let mine_earlier = claimed.contains(&finished);
+            // "Overwrite files already saved": download again and replace exactly
+            // this file once the new one is finished. Never when the file was made
+            // earlier in this run by another song with the same title.
+            let replace = opts.overwrite && !mine_earlier && finished.is_file();
+            if !opts.overwrite && !waiting && !mine_earlier && finished.is_file() {
                 already_saved(&shared, row_id);
                 journal(&format!("already saved, skipped {}", finished.display()));
                 continue;
@@ -192,7 +197,7 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             if let Some(path) = item.temp_path.clone() {
                 if Path::new(&path).is_file() {
                     set_fraction(&shared, row_id, 1.0);
-                    store_item(&shared, &ffmpeg, &opts, row_id, Path::new(&path), item, &dirs[index], track_total, &album, &playlist_thumb);
+                    store_item(&shared, &ffmpeg, &opts, row_id, Path::new(&path), item, &dirs[index], track_total, &album, &playlist_thumb, replace);
                     continue;
                 }
             }
@@ -291,7 +296,7 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 if let Some(path) = resolve_download(&work, &stem, &saved, &before) {
                     item.temp_path = Some(path.display().to_string());
                     set_fraction(&shared, row_id, 1.0);
-                    store_item(&shared, &ffmpeg, &opts, row_id, &path, item, dir, track_total, &album, &playlist_thumb);
+                    store_item(&shared, &ffmpeg, &opts, row_id, &path, item, dir, track_total, &album, &playlist_thumb, replace);
                     fetched_now = true;
                 } else {
                     fail(&shared, row_id, "The download finished without a file.");
@@ -316,7 +321,7 @@ enum DownloadOutcome {
     Failed,
 }
 
-fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, source: &Path, item: &crate::model::Item, dir: &Path, track_total: Option<u32>, album: &str, playlist_thumb: &str) {
+fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, source: &Path, item: &crate::model::Item, dir: &Path, track_total: Option<u32>, album: &str, playlist_thumb: &str, replace: bool) {
     if cancelled(shared) {
         return;
     }
@@ -395,7 +400,10 @@ fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, 
         fail(shared, row_id, "Stopped.");
         return;
     }
-    let destination = final_path(dir, &title, opts.container.extension(), source);
+    // With `replace`, the finished file takes the old file's name. The old file is
+    // only replaced here, by the final move, after the new one is complete, so a
+    // Cancel or a failure before this point leaves it as it was.
+    let destination = final_path(dir, &title, opts.container.extension(), source, replace);
     if destination.as_path() == source {
         let _ = fs::remove_file(source);
     }
@@ -575,7 +583,7 @@ fn resolve_download(dir: &Path, stem: &str, printed: &str, before: &std::collect
     let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !paths::is_download_of(&name, stem) || before.contains(&entry.file_name()) {
+        if name == paths::PARTIAL_DIR || !paths::is_download_of(&name, stem) || before.contains(&entry.file_name()) {
             continue;
         }
         if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
@@ -727,9 +735,9 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-fn final_path(dir: &Path, title: &str, extension: &str, source: &Path) -> PathBuf {
+fn final_path(dir: &Path, title: &str, extension: &str, source: &Path, replace: bool) -> PathBuf {
     let wanted = paths::final_file(dir, title, extension);
-    if wanted.as_path() == source || !wanted.exists() {
+    if replace || wanted.as_path() == source || !wanted.exists() {
         wanted
     } else {
         paths::unique_path_except(dir, title, extension, Some(source))
@@ -1081,7 +1089,30 @@ mod tests {
         let source = dir.join("Song (2).m4a");
         fs::write(&source, b"second").unwrap();
         // used to be "Song (3).m4a"
-        assert_eq!(final_path(&dir, "Song", "m4a", &source), source);
+        assert_eq!(final_path(&dir, "Song", "m4a", &source, false), source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_replaces_only_the_same_name_and_only_at_the_final_move() {
+        let dir = scratch("overwrite");
+        fs::write(dir.join("Song.mp4"), b"old").unwrap();
+        fs::write(dir.join("Song (Live).mp4"), b"live").unwrap();
+        let stem = paths::download_stem(&dir, "Song");
+        let source = dir.join(format!("{stem}.mkv"));
+        fs::write(&source, b"new download").unwrap();
+        // Picking the name changes nothing on disk.
+        let destination = final_path(&dir, "Song", "mp4", &source, true);
+        assert_eq!(destination, dir.join("Song.mp4"));
+        assert_eq!(fs::read(dir.join("Song.mp4")).unwrap(), b"old");
+        // Without the option, the old file keeps its name and the new one gets a number.
+        assert_eq!(final_path(&dir, "Song", "mp4", &source, false), dir.join("Song (2).mp4"));
+        // The final move replaces it in one step.
+        let ready = dir.join("part-1.mp4");
+        fs::write(&ready, b"new tagged").unwrap();
+        move_file(&ready, &destination).unwrap();
+        assert_eq!(fs::read(dir.join("Song.mp4")).unwrap(), b"new tagged");
+        assert_eq!(fs::read(dir.join("Song (Live).mp4")).unwrap(), b"live");
         let _ = fs::remove_dir_all(&dir);
     }
 
