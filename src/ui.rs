@@ -1386,8 +1386,14 @@ impl App {
             let row = (index / 3) as i32;
             let lx = self.s(8) + col * col_w;
             let ly = y + row * self.s(18);
-            let label_w = (col_w - self.s(72)).clamp(self.s(96), self.s(150));
-            let value_w = (col_w - label_w - self.s(6)).max(self.s(48));
+            // Time left and Elapsed need room for 01:05:10:00 / Calculating...
+            let timer = index == 3 || index == 4;
+            let label_w = if timer {
+                self.s(72)
+            } else {
+                (col_w - self.s(72)).clamp(self.s(96), self.s(150))
+            };
+            let value_w = (col_w - label_w - self.s(6)).max(if timer { self.s(88) } else { self.s(48) });
             self.static_text(lx, ly, label_w, self.s(16), label, false);
             self.readout[index] = self.static_text(lx + label_w, ly, value_w, self.s(16), "—", false);
             set_id(self.readout[index], ID_READOUT + index as i32);

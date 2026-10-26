@@ -55,35 +55,18 @@ pub fn format_eta(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "Calculating...".into();
     }
-    if seconds < 4.0 {
-        return "A few seconds".into();
+    let total = seconds.round() as u64;
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let secs = total % 60;
+    if days > 0 {
+        format!("{days:02}:{hours:02}:{minutes:02}:{secs:02}")
+    } else if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes:02}:{secs:02}")
     }
-    if seconds < 60.0 {
-        return format!("{} seconds", seconds.round() as i64);
-    }
-    if seconds < 3600.0 {
-        let mut minutes = (seconds / 60.0).round() as i64;
-        if minutes < 1 {
-            minutes = 1;
-        }
-        if minutes == 1 {
-            return "About 1 minute".into();
-        }
-        return format!("About {minutes} minutes");
-    }
-    let mut hours = (seconds / 3600.0) as i64;
-    let mut mins = ((seconds - hours as f64 * 3600.0) / 60.0).round() as i64;
-    if mins >= 60 {
-        hours += 1;
-        mins = 0;
-    }
-    if mins <= 0 {
-        if hours == 1 {
-            return "About 1 hour".into();
-        }
-        return format!("About {hours} hours");
-    }
-    format!("About {hours} h {mins} min")
 }
 
 /// Seconds left, from the whole run so far. `elapsed` is seconds since the run started,
@@ -144,8 +127,10 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.50 KB");
         assert_eq!(format_rate(2048.0), "2.00 KB/s");
         assert_eq!(format_items(1.2), "1.20");
-        assert_eq!(format_eta(2.0), "A few seconds");
-        assert_eq!(format_eta(90.0), "About 2 minutes");
+        assert_eq!(format_eta(2.0), "00:02");
+        assert_eq!(format_eta(90.0), "01:30");
+        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0), "05:10:00");
+        assert_eq!(format_eta(86_400.0 + 5.0 * 3600.0 + 10.0 * 60.0), "01:05:10:00");
         assert_eq!(format_elapsed(75), "1:15");
         assert_eq!(format_elapsed(3661), "1:01:01");
         assert_eq!(percent(0.999), 99);
