@@ -2139,6 +2139,11 @@ impl App {
                     self.last_notice = text.clone();
                     return Action::Popup(text);
                 }
+                // Checked here rather than while typing, so a half-typed path
+                // (for example one that starts with a quote) never pops up a message.
+                if let Err(text) = crate::paths::clean_location(&get_text(self.location_hwnd)) {
+                    return Action::Popup(text);
+                }
                 match tools::load_bundle() {
                     Ok(bundle) => self.store_bundle(bundle),
                     Err(err) => return Action::Popup(err),
@@ -2246,7 +2251,18 @@ impl App {
         if self.location_hwnd.0.is_null() {
             return;
         }
-        let text = get_text(self.location_hwnd);
+        let typed = get_text(self.location_hwnd);
+        // Show the full folder the files will go to. If the text can't be used,
+        // leave it as typed; the Options page explains why and Next stays off.
+        let text = match crate::paths::clean_location(&typed) {
+            Ok(full) => {
+                if full != typed {
+                    set_text(self.location_hwnd, &full);
+                }
+                full
+            }
+            Err(_) => typed,
+        };
         let saved = self
             .memory
             .profiles
@@ -2280,7 +2296,10 @@ impl App {
             strip_genre: checked(self.strip_genre_hwnd),
             min_wait: parse_u32(&get_text(self.min_hwnd), 4),
             max_wait: parse_u32(&get_text(self.max_hwnd), 8),
-            location: get_text(self.location_hwnd).trim().to_string(),
+            location: {
+                let typed = get_text(self.location_hwnd);
+                crate::paths::clean_location(&typed).unwrap_or_else(|_| typed.trim().to_string())
+            },
         }
     }
 
