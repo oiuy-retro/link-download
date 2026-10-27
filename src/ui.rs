@@ -38,12 +38,12 @@ use windows::Win32::UI::Controls::{
     TTTOOLINFOW, DRAWITEMSTRUCT, NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DOWN,
-    VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE,
+    VK_DOWN, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     FileOpenDialog, IFileDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
-    SIGDN_FILESYSPATH, DefSubclassProc, SetWindowSubclass,
+    SIGDN_FILESYSPATH, DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
@@ -59,8 +59,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     NCCALCSIZE_PARAMS, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXFRAME, SM_CXPADDEDBORDER,
     SM_CXSCREEN, SM_CYFRAME, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE,
+    WM_CHAR, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE,
     WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED,
     WS_SYSMENU, WS_THICKFRAME,
 };
@@ -123,6 +123,8 @@ const GROUP_LIMIT: usize = 1000;
 const WM_LIVE_NAME: u32 = WM_APP + 1;
 /// LVM_GETEDITCONTROL
 const LVM_GETEDITCONTROL: u32 = 0x1018;
+/// SetWindowSubclass id for Windows edit shortcuts (Ctrl+A, Ctrl+Backspace, Ctrl+Delete).
+const EDIT_KEYS_SUBCLASS: usize = 2;
 
 const PAGE_NAMES: [&str; 6] = ["Options", "Links", "Names", "Titles", "Metadata", "Download"];
 
@@ -1654,6 +1656,7 @@ impl App {
             bits |= 0x2000;
         }
         let hwnd = self.make(self.host, "Edit", "", bits, 0x200, x, y, w, self.s(if multi { 22 } else { 21 }), id, 0);
+        install_edit_keys(hwnd);
         if number {
             unsafe { SendMessageW(hwnd, 0x00C5, WPARAM(4), LPARAM(0)); }
         }
@@ -2141,6 +2144,7 @@ impl App {
             // The edit already ended. Its end notice did the work.
             return;
         }
+        install_edit_keys(edit);
         let index = list_focus_index(list);
         if index < 0 {
             return;
@@ -2168,6 +2172,8 @@ impl App {
                     let activate = &*(lparam.0 as *const NMITEMACTIVATE);
                     if activate.iItem >= 0 {
                         SendMessageW(header.hwndFrom, LVM_EDITLABELW, WPARAM(activate.iItem as usize), LPARAM(0));
+                        let edit = HWND(SendMessageW(header.hwndFrom, LVM_GETEDITCONTROL, WPARAM(0), LPARAM(0)).0 as *mut _);
+                        install_edit_keys(edit);
                     }
                 }
                 return Action::None;
@@ -3870,6 +3876,7 @@ fn edit_filename(list: HWND, index: i32) {
         let edit = SendMessageW(list, LVM_EDITLABELW, WPARAM(index as usize), LPARAM(0));
         let edit = HWND(edit.0 as *mut _);
         if !edit.0.is_null() {
+            install_edit_keys(edit);
             SendMessageW(edit, 0x00B1, WPARAM(0), LPARAM(-1));
         }
     }
@@ -3931,7 +3938,7 @@ fn shortcut(msg: &MSG) -> bool {
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
-        if !alt && edit_key(key, shift, ctrl) {
+        if !alt && edit_key(key, shift, ctrl, msg.hwnd) {
             return true;
         }
         let up = key == VK_UP.0 as usize;
@@ -3956,6 +3963,9 @@ fn shortcut(msg: &MSG) -> bool {
             return activate_default();
         }
     }
+    if msg.message == WM_CHAR && edit_char(msg.wParam.0, msg.hwnd) {
+        return true;
+    }
     if msg.message == 0x0106 {
         // WM_SYSCHAR
         let ch = (msg.wParam.0 as u8 as char).to_ascii_uppercase();
@@ -3969,56 +3979,167 @@ fn is_tool_field(id: i32) -> bool {
     (ID_REMOVE..ID_MODE).contains(&id) || (ID_FIND..ID_STRIP).contains(&id)
 }
 
+fn install_edit_keys(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowSubclass(hwnd, Some(edit_keys_proc), EDIT_KEYS_SUBCLASS, 0);
+    }
+}
+
+unsafe extern "system" fn edit_keys_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+        let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+        if !alt && apply_edit_key(hwnd, wparam.0, shift, ctrl) {
+            return LRESULT(0);
+        }
+    }
+    if msg == WM_CHAR && apply_edit_char(hwnd, wparam.0) {
+        return LRESULT(0);
+    }
+    if msg == WM_NCDESTROY {
+        let _ = RemoveWindowSubclass(hwnd, Some(edit_keys_proc), EDIT_KEYS_SUBCLASS);
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+fn is_edit_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Edit")
+}
+
+fn combo_edit(combo: HWND) -> HWND {
+    let child = neighbor(combo, GW_CHILD);
+    if is_edit_class(&class_name(child)) {
+        child
+    } else {
+        HWND(std::ptr::null_mut())
+    }
+}
+
+fn as_edit(hwnd: HWND) -> Option<HWND> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let class = class_name(hwnd);
+    if is_edit_class(&class) {
+        return Some(hwnd);
+    }
+    if class.eq_ignore_ascii_case("ComboBox") {
+        let inner = combo_edit(hwnd);
+        if !inner.0.is_null() {
+            return Some(inner);
+        }
+    }
+    if class == "SysListView32" {
+        let edit = unsafe { HWND(SendMessageW(hwnd, LVM_GETEDITCONTROL, WPARAM(0), LPARAM(0)).0 as *mut _) };
+        if !edit.0.is_null() {
+            return Some(edit);
+        }
+    }
+    None
+}
+
+fn focused_edit(msg_hwnd: HWND) -> HWND {
+    let focus = unsafe { GetFocus() };
+    if let Some(edit) = as_edit(focus) {
+        return edit;
+    }
+    if let Some(edit) = as_edit(msg_hwnd) {
+        return edit;
+    }
+    HWND(std::ptr::null_mut())
+}
+
 /// Keys the classic text box gets wrong or does not know. Returns true when handled.
 /// - Left and Right with a selection go to its start and its end, like current Windows.
 ///   The classic box moves one character from the caret instead, so after Tab selected a
 ///   whole name, both keys landed at the right.
-/// - Ctrl+A selects everything. The classic box ignores it.
+/// - Ctrl+A selects everything. The classic box ignores it and beeps.
 /// - Ctrl+Backspace deletes the word before the caret. The classic box types a box
 ///   character instead. The deletion can be undone with Ctrl+Z.
-fn edit_key(key: usize, shift: bool, ctrl: bool) -> bool {
-    let focus = unsafe { GetFocus() };
-    if focus.0.is_null() || class_name(focus) != "Edit" {
+/// - Ctrl+Delete deletes the word after the caret.
+fn edit_key(key: usize, shift: bool, ctrl: bool, msg_hwnd: HWND) -> bool {
+    let hwnd = focused_edit(msg_hwnd);
+    if hwnd.0.is_null() {
         return false;
     }
+    apply_edit_key(hwnd, key, shift, ctrl)
+}
+
+fn edit_char(ch: usize, msg_hwnd: HWND) -> bool {
+    let hwnd = focused_edit(msg_hwnd);
+    if hwnd.0.is_null() {
+        // A closed drop-down still gets Ctrl+A and would beep.
+        return ch == 1 || ch == 127;
+    }
+    apply_edit_char(hwnd, ch)
+}
+
+fn apply_edit_char(hwnd: HWND, ch: usize) -> bool {
+    if ch == 1 {
+        apply_edit_key(hwnd, b'A' as usize, false, true);
+        return true;
+    }
+    if ch == 127 {
+        return true;
+    }
+    false
+}
+
+fn apply_edit_key(hwnd: HWND, key: usize, shift: bool, ctrl: bool) -> bool {
     let left = key == VK_LEFT.0 as usize;
     let right = key == VK_RIGHT.0 as usize;
     if (left || right) && !shift && !ctrl {
-        let (start, end) = edit_selection(focus);
+        let (start, end) = edit_selection(hwnd);
         if start == end {
             return false;
         }
         let at = if left { start } else { end };
         unsafe {
-            SendMessageW(focus, 0x00B1, WPARAM(at), LPARAM(at as isize));
+            SendMessageW(hwnd, 0x00B1, WPARAM(at), LPARAM(at as isize));
             // EM_SCROLLCARET
-            SendMessageW(focus, 0x00B7, WPARAM(0), LPARAM(0));
+            SendMessageW(hwnd, 0x00B7, WPARAM(0), LPARAM(0));
         }
         return true;
     }
     if key == b'A' as usize && ctrl && !shift {
-        unsafe { SendMessageW(focus, 0x00B1, WPARAM(0), LPARAM(-1)); }
+        unsafe { SendMessageW(hwnd, 0x00B1, WPARAM(0), LPARAM(-1)); }
         return true;
     }
-    if key == VK_BACK.0 as usize && ctrl {
-        let style = unsafe { GetWindowLongPtrW(focus, GWL_STYLE) as u32 };
+    if (key == VK_BACK.0 as usize || key == VK_DELETE.0 as usize) && ctrl {
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 };
         if style & 0x0800 != 0 {
             // ES_READONLY
             return true;
         }
-        let (start, end) = edit_selection(focus);
+        let (start, end) = edit_selection(hwnd);
         if start == end {
-            let text: Vec<u16> = get_text(focus).encode_utf16().collect();
-            let from = word_start_before(&text, end.min(text.len()));
-            if from == end {
+            let text: Vec<u16> = get_text(hwnd).encode_utf16().collect();
+            let caret = end.min(text.len());
+            let (from, to) = if key == VK_BACK.0 as usize {
+                (word_start_before(&text, caret), caret)
+            } else {
+                (caret, word_end_after(&text, caret))
+            };
+            if from == to {
                 return true;
             }
-            unsafe { SendMessageW(focus, 0x00B1, WPARAM(from), LPARAM(end as isize)); }
+            unsafe { SendMessageW(hwnd, 0x00B1, WPARAM(from), LPARAM(to as isize)); }
         }
         let empty = [0u16; 1];
         unsafe {
             // EM_REPLACESEL with undo allowed.
-            SendMessageW(focus, 0x00C2, WPARAM(1), LPARAM(empty.as_ptr() as isize));
+            SendMessageW(hwnd, 0x00C2, WPARAM(1), LPARAM(empty.as_ptr() as isize));
         }
         return true;
     }
@@ -4066,6 +4187,39 @@ fn word_start_before(text: &[u16], caret: usize) -> usize {
     let kind = word(at(i - 1));
     while i > 0 && !space(at(i - 1)) && !newline(at(i - 1)) && word(at(i - 1)) == kind {
         i -= 1;
+    }
+    i
+}
+
+/// Where Ctrl+Delete stops: spaces after the caret, then one run of word characters or
+/// one run of punctuation. A line break after the caret is deleted on its own.
+fn word_end_after(text: &[u16], caret: usize) -> usize {
+    let caret = caret.min(text.len());
+    let at = |i: usize| text[i];
+    let newline = |c: u16| c == b'\n' as u16 || c == b'\r' as u16;
+    let space = |c: u16| c == b' ' as u16 || c == b'\t' as u16 || c == 0x00A0 || c == 0x3000;
+    let word = |c: u16| {
+        if (0xD800..0xE000).contains(&c) {
+            return true;
+        }
+        char::from_u32(c as u32).map(|ch| ch.is_alphanumeric() || ch == '_' || ch == '\'').unwrap_or(true)
+    };
+    let mut i = caret;
+    if i < text.len() && newline(at(i)) {
+        if at(i) == b'\r' as u16 && i + 1 < text.len() && at(i + 1) == b'\n' as u16 {
+            return i + 2;
+        }
+        return i + 1;
+    }
+    while i < text.len() && space(at(i)) {
+        i += 1;
+    }
+    if i == text.len() || newline(at(i)) {
+        return i;
+    }
+    let kind = word(at(i));
+    while i < text.len() && !space(at(i)) && !newline(at(i)) && word(at(i)) == kind {
+        i += 1;
     }
     i
 }
@@ -4602,11 +4756,20 @@ mod live_name_tests {
 
 #[cfg(test)]
 mod text_key_tests {
-    use super::{is_tool_field, word_start_before, ID_FIND, ID_INSERT, ID_MODE, ID_REMOVE, ID_STRIP};
+    use super::{
+        apply_edit_char, is_edit_class, is_tool_field, word_end_after, word_start_before, ID_FIND, ID_INSERT,
+        ID_LINKS, ID_LOCATION, ID_MODE, ID_NAME, ID_REMOVE, ID_STRIP, ID_TITLE_FIELD,
+    };
+    use windows::Win32::Foundation::HWND;
 
     fn start(text: &str, caret: usize) -> usize {
         let wide: Vec<u16> = text.encode_utf16().collect();
         word_start_before(&wide, caret)
+    }
+
+    fn end(text: &str, caret: usize) -> usize {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        word_end_after(&wide, caret)
     }
 
     #[test]
@@ -4648,6 +4811,43 @@ mod text_key_tests {
         assert!(!is_tool_field(ID_MODE));
         assert!(!is_tool_field(ID_STRIP));
         assert!(!is_tool_field(22000));
+    }
+
+    #[test]
+    fn ctrl_a_is_for_every_text_box() {
+        assert!(!is_tool_field(ID_LOCATION));
+        assert!(!is_tool_field(ID_NAME));
+        assert!(!is_tool_field(ID_LINKS));
+        assert!(!is_tool_field(ID_TITLE_FIELD));
+        assert!(is_edit_class("Edit"));
+        assert!(is_edit_class("EDIT"));
+    }
+
+    #[test]
+    fn ctrl_delete_deletes_one_word() {
+        assert_eq!(end("hello world", 0), 5);
+        assert_eq!(end("hello world", 5), 11);
+        assert_eq!(end("hello  world", 5), 12);
+        assert_eq!(end("hello", 5), 5);
+        assert_eq!(end("", 0), 0);
+    }
+
+    #[test]
+    fn ctrl_delete_treats_punctuation_and_breaks_like_backspace() {
+        assert_eq!(end("name?? ", 4), 6);
+        assert_eq!(end("Song - Artist", 4), 6);
+        assert_eq!(end("one\r\ntwo", 3), 5);
+        assert_eq!(end("abc", 99), 3);
+    }
+
+    #[test]
+    fn leftover_ctrl_characters_do_not_beep() {
+        let none = HWND(std::ptr::null_mut());
+        assert!(apply_edit_char(none, 127));
+        // Ctrl+C / Ctrl+V / Ctrl+Z still go to the box.
+        assert!(!apply_edit_char(none, 3));
+        assert!(!apply_edit_char(none, 22));
+        assert!(!apply_edit_char(none, 26));
     }
 }
 

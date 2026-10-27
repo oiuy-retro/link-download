@@ -2,9 +2,9 @@
 
 Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/issues) tab.
 
-## Window resize covers Download readouts
+## Text fields ignore Windows shortcuts
 
-[#16](https://github.com/oiuy-retro/link-download/issues/16). Stretching the window, especially from the bottom edge on the Download page, grows the white work list over the progress bar and the Speed / Time left row.
+[#18](https://github.com/oiuy-retro/link-download/issues/18). Ctrl+A does nothing in most text boxes and plays the Windows error sound. Ctrl+Backspace and Ctrl+Delete should work in every box, not only Remove / Insert / Find.
 
 ## Custom mouse cursor
 
