@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
@@ -19,7 +19,9 @@ use windows::Win32::Graphics::Gdi::{
     SetBkMode, SetTextColor, UpdateWindow, BF_RECT, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_WINDOW,
     COLOR_WINDOWTEXT, EDGE_ETCHED, EDGE_RAISED, EDGE_SUNKEN, HBRUSH, HDC, HFONT, HRGN, LOGPIXELSX,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, SetWindowRgn, SRCCOPY, TRANSPARENT, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, DT_EDITCONTROL,
+    DT_WORDBREAK, DrawFocusRect, GetSysColorBrush, GetTextExtentPoint32W, GetTextMetricsW, SetTextAlign, TextOutW,
+    SYS_COLOR_INDEX, TEXTMETRICW, TEXT_ALIGN_OPTIONS,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -33,7 +35,7 @@ use windows::Win32::UI::Controls::{
     LVS_EX_FULLROWSELECT, NMITEMACTIVATE, NM_CLICK, NM_DBLCLK, PBM_SETPOS, PBM_SETRANGE32, TTM_ADDTOOLW,
     TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH,
     LVCFMT_LEFT, LVCOLUMNW, LVIF_TEXT, LVITEMW, NMHDR, NMLVDISPINFOW, TTF_IDISHWND, TTF_SUBCLASS,
-    TTTOOLINFOW,
+    TTTOOLINFOW, DRAWITEMSTRUCT, NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetFocus, VK_DOWN, VK_RETURN, VK_SHIFT,
@@ -51,7 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, BM_GETCHECK, BM_SETCHECK,
     CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, DI_NORMAL, EN_CHANGE, EN_KILLFOCUS, GW_CHILD, GW_HWNDNEXT, GWL_STYLE,
-    GWLP_ID, HMENU, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
+    GWLP_ID, GWLP_USERDATA, HMENU, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
     HTTOPLEFT, HTTOPRIGHT, HWND_TOP, IDC_ARROW, IMAGE_ICON, MB_ICONEXCLAMATION, MB_OK, MINMAXINFO, MSG,
     NCCALCSIZE_PARAMS, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXFRAME, SM_CXPADDEDBORDER,
     SM_CXSCREEN, SM_CYFRAME, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
@@ -63,6 +65,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::classic::{self, CapHot};
+use crate::paths::Mark;
 
 use crate::model::{
     can_advance, container_after_toggle, problems, AudioCodec, AudioQuality, Container, Options,
@@ -126,6 +129,11 @@ thread_local! {
     // Wheel movement smaller than one step, kept for the next message. Touchpads send small deltas.
     static PAGE_WHEEL_REST: Cell<i32> = const { Cell::new(0) };
     static WORK_WHEEL_REST: Cell<i32> = const { Cell::new(0) };
+    // Bold fonts for the characters that make a file name illegal: 12 pt, then 10 pt and
+    // 8 pt for rows too short for it.
+    static MARK_BIG: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
+    static MARK_SMALL: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
+    static MARK_TINY: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -260,6 +268,13 @@ pub fn run() -> i32 {
         WINDOW_BRUSH.set(window_brush);
         register_classes(instance, face);
         APP.with(|slot| *slot.borrow_mut() = Some(App::boot(instance)));
+        APP.with(|slot| {
+            if let Some(app) = slot.borrow().as_ref() {
+                MARK_BIG.set(app.title_font);
+                MARK_SMALL.set(make_font(10, app.dpi, true));
+                MARK_TINY.set(make_font(8, app.dpi, true));
+            }
+        });
         let hwnd = create_main(instance);
         if hwnd.0.is_null() {
             return 1;
@@ -484,7 +499,22 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     if matches!(msg, 0x0138 | 0x0135 | 0x0133 | 0x0134) {
         return paint_control(msg, wparam, lparam);
     }
-    if matches!(msg, WM_COMMAND | WM_NOTIFY | WM_VSCROLL | WM_MOUSEWHEEL) && !IN_CALLBACK.get() {
+    if msg == 0x002B {
+        // WM_DRAWITEM. Only the Names page warning line is owner-drawn. It needs nothing from the app state.
+        let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+        if item.CtlType.0 == 5 && (ID_NAME_ERROR..ID_NAME_ERROR + GROUP_LIMIT as i32).contains(&(item.CtlID as i32)) {
+            draw_name_error(item);
+            return LRESULT(1);
+        }
+    }
+    if msg == WM_NOTIFY {
+        let header = &*(lparam.0 as *const NMHDR);
+        if header.code == 0xFFFF_FFF4 && (ID_LIST..ID_ALBUM).contains(&child_id(header.hwndFrom)) && class_name(header.hwndFrom) == "SysListView32" {
+            // NM_CUSTOMDRAW from a Names list.
+            return LRESULT(name_row_draw(lparam));
+        }
+    }
+    if matches!(msg, WM_COMMAND | WM_NOTIFY | WM_VSCROLL | WM_MOUSEWHEEL | 0x002B) && !IN_CALLBACK.get() {
         let parent = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or(HWND(std::ptr::null_mut()));
         return SendMessageW(parent, msg, wparam, lparam);
     }
@@ -1221,9 +1251,10 @@ impl App {
             let list = self.listview(self.s(8), y, w - self.s(16), list_h, ID_LIST + group_index as i32);
             fill_titles(list, &titles, w - self.s(24));
             y += list_h + self.s(4);
-            let problem = paths::name_problem_line(&self.groups[group_index].items).unwrap_or_default();
-            let error = self.static_text(self.s(8), y, w - self.s(16), self.s(32), &problem, true);
+            // SS_OWNERDRAW, so the characters that make the name illegal can be drawn in bold.
+            let error = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x000D, 0, self.s(8), y, w - self.s(16), self.s(32), 0, 0);
             set_id(error, ID_NAME_ERROR + group_index as i32);
+            show_name_error(error, &self.groups[group_index].items);
             y += self.s(36);
         }
         y
@@ -1749,8 +1780,7 @@ impl App {
         }
         for (index, group) in self.groups.iter().enumerate().take(GROUP_LIMIT) {
             if let Ok(label) = child(self.pane(), ID_NAME_ERROR + index as i32) {
-                let text = paths::name_problem_line(&group.items).unwrap_or_default();
-                set_text(label, &text);
+                show_name_error(label, &group.items);
             }
         }
     }
@@ -3004,6 +3034,250 @@ fn fill_titles(list: HWND, titles: &[String], width: i32) {
     }
 }
 
+/// Puts the problem line on the Names page warning label. The label keeps how many
+/// characters at the start are the file name, so only those get the bold marks.
+fn show_name_error(label: HWND, items: &[crate::model::Item]) {
+    let (name, line) = paths::first_name_problem(items).unwrap_or_default();
+    unsafe { SetWindowLongPtrW(label, GWLP_USERDATA, name.chars().count() as isize); }
+    if get_text(label) == line {
+        unsafe { let _ = InvalidateRect(label, None, true); }
+    }
+    set_text(label, &line);
+}
+
+fn draw_name_error(item: &DRAWITEMSTRUCT) {
+    unsafe {
+        let hdc = item.hDC;
+        let rect = item.rcItem;
+        let _ = FillRect(hdc, &rect, FACE.get());
+        let label = item.hwndItem;
+        let text = get_text(label);
+        if text.is_empty() {
+            return;
+        }
+        let normal = HFONT(SendMessageW(label, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+        let old = SelectObject(hdc, normal);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let color = if IsWindowEnabled(label).0 != 0 { COLOR_BTNTEXT } else { COLOR_GRAYTEXT };
+        let _ = SetTextColor(hdc, COLORREF(GetSysColor(color)));
+        let chars: Vec<char> = text.chars().collect();
+        let name_len = (GetWindowLongPtrW(label, GWLP_USERDATA).max(0) as usize).min(chars.len());
+        let name: String = chars[..name_len].iter().collect();
+        let marks = paths::name_marks(&name);
+        if name_len == 0 || marks.iter().all(|(_, mark)| *mark == Mark::Plain) {
+            // Same as a plain label: wrapped, no prefix characters.
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            let mut area = rect;
+            let _ = DrawTextW(hdc, &mut wide, &mut area, DT_LEFT | DT_NOPREFIX | DT_WORDBREAK | DT_EDITCONTROL);
+            SelectObject(hdc, old);
+            return;
+        }
+        // The name with its marks on the first line, the reason on the second.
+        let (normal_h, _) = font_height(hdc, normal);
+        let room = (rect.bottom - rect.top - normal_h).max(normal_h);
+        let bold = mark_font(hdc, room);
+        let (bold_h, _) = ink_height(hdc, bold);
+        let first_h = bold_h.max(normal_h);
+        let first = RECT { bottom: rect.top + first_h, ..rect };
+        let mut line = marks;
+        line.push((':', Mark::Plain));
+        draw_marked(hdc, &first, &line, normal, bold, COLORREF(GetSysColor(color)), rgb(192, 192, 192));
+        let rest: String = chars[name_len..].iter().collect();
+        let rest = rest.trim_start_matches(':').trim_start();
+        let mut wide: Vec<u16> = rest.encode_utf16().collect();
+        let mut area = RECT { top: first.bottom, ..rect };
+        SelectObject(hdc, normal);
+        let _ = DrawTextW(hdc, &mut wide, &mut area, DT_LEFT | DT_NOPREFIX | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS);
+        SelectObject(hdc, old);
+    }
+}
+
+/// NM_CUSTOMDRAW for a Names list. Rows with a legal name are left to the list.
+/// Rows with marks are drawn here, with the list's own colors for each state.
+fn name_row_draw(lparam: LPARAM) -> isize {
+    unsafe {
+        let draw = &*(lparam.0 as *const NMLVCUSTOMDRAW);
+        let stage = draw.nmcd.dwDrawStage.0;
+        if stage == 0x0001 {
+            // CDDS_PREPAINT: ask for each row.
+            return 0x20;
+        }
+        if stage != 0x0001_0001 {
+            return 0;
+        }
+        let list = draw.nmcd.hdr.hwndFrom;
+        let index = draw.nmcd.dwItemSpec as i32;
+        let marks = paths::name_marks(&list_text(list, index));
+        if marks.iter().all(|(_, mark)| *mark == Mark::Plain) {
+            return 0;
+        }
+        let hdc = draw.nmcd.hdc;
+        // LVM_GETITEMRECT with LVIR_BOUNDS, then LVIR_LABEL.
+        let mut bounds = RECT { left: 0, ..Default::default() };
+        SendMessageW(list, 0x100E, WPARAM(index as usize), LPARAM(&mut bounds as *mut _ as isize));
+        let mut label = RECT { left: 2, ..Default::default() };
+        SendMessageW(list, 0x100E, WPARAM(index as usize), LPARAM(&mut label as *mut _ as isize));
+        // LVM_GETITEMSTATE for LVIS_FOCUSED | LVIS_SELECTED.
+        let state = SendMessageW(list, 0x102C, WPARAM(index as usize), LPARAM(0x0003)).0 as u32;
+        let selected = state & 0x0002 != 0;
+        let focused = state & 0x0001 != 0;
+        let has_focus = GetFocus() == list;
+        let enabled = IsWindowEnabled(list).0 != 0;
+        let (back, fore) = row_colors(selected, has_focus, enabled);
+        let _ = FillRect(hdc, &bounds, GetSysColorBrush(COLOR_WINDOW));
+        let row = RECT { left: label.left, ..bounds };
+        if back != COLOR_WINDOW {
+            let _ = FillRect(hdc, &row, GetSysColorBrush(back));
+        }
+        let normal = HFONT(SendMessageW(list, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+        let old = SelectObject(hdc, normal);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(GetSysColor(fore)));
+        let bold = mark_font(hdc, bounds.bottom - bounds.top);
+        // The list starts its own text 5 pixels into the label and keeps 5 free at the end.
+        let text = RECT { left: label.left + 5, right: label.right - 5, ..label };
+        draw_marked(hdc, &text, &marks, normal, bold, COLORREF(GetSysColor(fore)), COLORREF(GetSysColor(back)));
+        if focused && has_focus {
+            let _ = DrawFocusRect(hdc, &row);
+        }
+        SelectObject(hdc, old);
+        // CDRF_SKIPDEFAULT
+        4
+    }
+}
+
+/// Background and text colors of a list row, the way a classic list view picks them.
+fn row_colors(selected: bool, list_focused: bool, enabled: bool) -> (SYS_COLOR_INDEX, SYS_COLOR_INDEX) {
+    if !enabled {
+        return (COLOR_WINDOW, COLOR_GRAYTEXT);
+    }
+    match (selected, list_focused) {
+        (true, true) => (COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT),
+        (true, false) => (COLOR_BTNFACE, COLOR_BTNTEXT),
+        _ => (COLOR_WINDOW, COLOR_WINDOWTEXT),
+    }
+}
+
+/// Character height and ascent of a font.
+unsafe fn font_height(hdc: HDC, font: HFONT) -> (i32, i32) {
+    let old = SelectObject(hdc, font);
+    let mut metrics = TEXTMETRICW::default();
+    let _ = GetTextMetricsW(hdc, &mut metrics);
+    SelectObject(hdc, old);
+    (metrics.tmHeight, metrics.tmAscent)
+}
+
+/// Height and ascent of the characters themselves, without the font's internal leading,
+/// which is empty space above them. Used for the bold marks.
+unsafe fn ink_height(hdc: HDC, font: HFONT) -> (i32, i32) {
+    let old = SelectObject(hdc, font);
+    let mut metrics = TEXTMETRICW::default();
+    let _ = GetTextMetricsW(hdc, &mut metrics);
+    SelectObject(hdc, old);
+    (metrics.tmHeight - metrics.tmInternalLeading, metrics.tmAscent - metrics.tmInternalLeading)
+}
+
+/// The biggest bold font that fits in `height`: 12 pt, else 10 pt, else 8 pt.
+unsafe fn mark_font(hdc: HDC, height: i32) -> HFONT {
+    let fonts = [MARK_BIG.get(), MARK_SMALL.get(), MARK_TINY.get()];
+    let heights = fonts.map(|font| if font.0.is_null() { i32::MAX } else { ink_height(hdc, font).0 });
+    fonts[pick_mark(&heights, height)]
+}
+
+/// Index of the first font height that fits in `room`, or the last one when none does.
+fn pick_mark(heights: &[i32], room: i32) -> usize {
+    heights.iter().position(|h| *h <= room).unwrap_or(heights.len() - 1)
+}
+
+fn text_width(hdc: HDC, text: &[u16]) -> i32 {
+    let mut size = SIZE::default();
+    unsafe { let _ = GetTextExtentPoint32W(hdc, text, &mut size); }
+    size.cx
+}
+
+/// Draws one line, marked characters in `bold` and the rest in `normal`, on one baseline
+/// centered in `rect`. A last space or period is also drawn in reverse, `back` on `fore`,
+/// so it can be seen. A line that does not fit ends with "...".
+unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFONT, bold: HFONT, fore: COLORREF, back: COLORREF) {
+    let (normal_h, normal_up) = font_height(hdc, normal);
+    let (bold_h, bold_up) = ink_height(hdc, bold);
+    let mut widths = Vec::with_capacity(marks.len());
+    for (ch, mark) in marks {
+        SelectObject(hdc, if *mark == Mark::Plain { normal } else { bold });
+        let mut buf = [0u16; 2];
+        widths.push(text_width(hdc, ch.encode_utf16(&mut buf)));
+    }
+    SelectObject(hdc, normal);
+    let dots: Vec<u16> = "...".encode_utf16().collect();
+    let keep = fit_count(&widths, rect.right - rect.left, text_width(hdc, &dots));
+    let up = normal_up.max(bold_up);
+    let down = (normal_h - normal_up).max(bold_h - bold_up);
+    let baseline = marked_baseline(rect.top, rect.bottom, normal_h, normal_up, bold_h, bold_up);
+    let align = SetTextAlign(hdc, TEXT_ALIGN_OPTIONS(24));
+    let mut x = rect.left;
+    let mut start = 0;
+    while start < keep {
+        let mark = marks[start].1;
+        let mut end = start;
+        while end < keep && marks[end].1 == mark {
+            end += 1;
+        }
+        let run: String = marks[start..end].iter().map(|(ch, _)| *ch).collect();
+        let wide: Vec<u16> = run.encode_utf16().collect();
+        SelectObject(hdc, if mark == Mark::Plain { normal } else { bold });
+        let width = text_width(hdc, &wide);
+        if mark == Mark::End {
+            let block = RECT { left: x, top: baseline - up, right: x + width, bottom: baseline + down };
+            let brush = CreateSolidBrush(fore);
+            let _ = FillRect(hdc, &block, brush);
+            let _ = DeleteObject(brush);
+            let _ = SetTextColor(hdc, back);
+            let _ = TextOutW(hdc, x, baseline, &wide);
+            let _ = SetTextColor(hdc, fore);
+        } else {
+            let _ = TextOutW(hdc, x, baseline, &wide);
+        }
+        x += width;
+        start = end;
+    }
+    if keep < marks.len() {
+        SelectObject(hdc, normal);
+        let _ = TextOutW(hdc, x, baseline, &dots);
+    }
+    SetTextAlign(hdc, TEXT_ALIGN_OPTIONS(align));
+    SelectObject(hdc, normal);
+}
+
+/// The plain text sits where the list would put it, centered in the row. The bigger
+/// bold characters share its baseline and are only moved when they would leave the row.
+fn marked_baseline(top: i32, bottom: i32, normal_h: i32, normal_up: i32, bold_h: i32, bold_up: i32) -> i32 {
+    let mut baseline = top + (bottom - top - normal_h) / 2 + normal_up;
+    let low = baseline + (bold_h - bold_up).max(normal_h - normal_up);
+    if low > bottom {
+        baseline -= low - bottom;
+    }
+    let high = baseline - bold_up.max(normal_up);
+    if high < top {
+        baseline += top - high;
+    }
+    baseline
+}
+
+/// How many characters fit in `room`. When not all of them fit, room is kept for the dots.
+fn fit_count(widths: &[i32], room: i32, dots: i32) -> usize {
+    if widths.iter().sum::<i32>() <= room {
+        return widths.len();
+    }
+    let mut used = 0;
+    for (index, width) in widths.iter().enumerate() {
+        if used + width + dots > room {
+            return index;
+        }
+        used += width;
+    }
+    widths.len()
+}
+
 fn list_text(list: HWND, index: i32) -> String {
     let mut buf = [0u16; 1024];
     let item = LVITEMW {
@@ -3797,5 +4071,54 @@ mod tests {
         for class in ["Static", "Button", "SysHeader32", "LinkDownloadHost", ""] {
             assert!(!wheel_to_control(class, false, true));
         }
+    }
+
+    #[test]
+    fn a_name_that_fits_is_drawn_whole() {
+        assert_eq!(fit_count(&[5, 5, 5], 15, 6), 3);
+        assert_eq!(fit_count(&[], 0, 6), 0);
+    }
+
+    #[test]
+    fn a_long_name_leaves_room_for_the_dots() {
+        // 4 characters of 5 do not fit in 18, so as many as fit beside 6 for the dots.
+        assert_eq!(fit_count(&[5, 5, 5, 5], 18, 6), 2);
+        assert_eq!(fit_count(&[5, 9, 5], 10, 6), 0);
+    }
+
+    #[test]
+    fn marks_share_the_plain_baseline_inside_the_row() {
+        // A 17 pixel row, 13 pixel plain text (ascent 11), 17 pixel bold (ascent 14).
+        // Centered plain text would put the bold top 1 pixel above the row, so it moves down 1.
+        let baseline = marked_baseline(0, 17, 13, 11, 17, 14);
+        assert_eq!(baseline, 2 + 11 + 1);
+        assert!(baseline - 14 >= 0 && baseline + 3 <= 17);
+        // With room to spare nothing moves.
+        assert_eq!(marked_baseline(0, 20, 13, 11, 16, 13), 3 + 11);
+        // Plain text only: centered, the same as the list.
+        assert_eq!(marked_baseline(10, 24, 13, 11, 13, 11), 10 + 0 + 11);
+        // A bold font taller than the room keeps its top inside.
+        assert_eq!(marked_baseline(0, 14, 13, 11, 16, 13), 13);
+    }
+
+    #[test]
+    fn the_biggest_mark_font_that_fits_is_used() {
+        // 12, 10 and 8 pt at 96 DPI.
+        let heights = [16, 13, 13];
+        assert_eq!(pick_mark(&heights, 18), 0);
+        assert_eq!(pick_mark(&heights, 16), 0);
+        assert_eq!(pick_mark(&heights, 14), 1);
+        // At 120 DPI: 20, 17 and 13 pixels in a 15 pixel row.
+        assert_eq!(pick_mark(&[20, 17, 13], 15), 2);
+        assert_eq!(pick_mark(&[20, 17, 13], 10), 2);
+    }
+
+    #[test]
+    fn row_colors_follow_the_classic_list() {
+        assert_eq!(row_colors(true, true, true), (COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT));
+        assert_eq!(row_colors(true, false, true), (COLOR_BTNFACE, COLOR_BTNTEXT));
+        assert_eq!(row_colors(false, true, true), (COLOR_WINDOW, COLOR_WINDOWTEXT));
+        assert_eq!(row_colors(false, false, true), (COLOR_WINDOW, COLOR_WINDOWTEXT));
+        assert_eq!(row_colors(true, true, false), (COLOR_WINDOW, COLOR_GRAYTEXT));
     }
 }

@@ -9,10 +9,56 @@ use std::path::{Path, PathBuf};
 
 use crate::model::Group;
 
+/// A character Windows does not allow anywhere in a file name.
+pub fn is_invalid_char(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+}
+
+/// Shown in place of a control character, which has no picture of its own.
+pub const CONTROL_MARK: char = '\u{a4}';
+/// Shown in place of a trailing space, so the marked character can be seen.
+pub const SPACE_MARK: char = '\u{b7}';
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    Plain,
+    /// A character Windows never allows.
+    Bad,
+    /// A space or period that is only wrong because it is last.
+    End,
+}
+
+/// The name as it is drawn, one entry per character, with how each one is marked.
+/// Reserved and too-long names are not about one character, so nothing is marked.
+pub fn name_marks(name: &str) -> Vec<(char, Mark)> {
+    let mut marks: Vec<(char, Mark)> = name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() {
+                (CONTROL_MARK, Mark::Bad)
+            } else if is_invalid_char(ch) {
+                (ch, Mark::Bad)
+            } else {
+                (ch, Mark::Plain)
+            }
+        })
+        .collect();
+    if !name.trim().is_empty() {
+        if let Some(last) = marks.last_mut() {
+            if last.0 == ' ' {
+                *last = (SPACE_MARK, Mark::End);
+            } else if last.0 == '.' {
+                last.1 = Mark::End;
+            }
+        }
+    }
+    marks
+}
+
 pub fn sanitize(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
-        if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+        if is_invalid_char(ch) {
             out.push('_');
         } else {
             out.push(ch);
@@ -46,6 +92,12 @@ pub fn sanitize(name: &str) -> String {
 
 /// The first illegal file name in this list, or nothing when every saved name is legal.
 pub fn name_problem_line(items: &[crate::model::Item]) -> Option<String> {
+    first_name_problem(items).map(|(_, line)| line)
+}
+
+/// The first illegal file name and the whole problem line. The line starts with the name
+/// and ": " unless the name is blank.
+pub fn first_name_problem(items: &[crate::model::Item]) -> Option<(String, String)> {
     let mut count = 0usize;
     let mut first: Option<(&str, &str)> = None;
     for item in items.iter().filter(|item| item.blocked.is_none()) {
@@ -57,12 +109,10 @@ pub fn name_problem_line(items: &[crate::model::Item]) -> Option<String> {
         }
     }
     let (name, problem) = first?;
-    let detail = if name.trim().is_empty() { problem.to_string() } else { format!("{name}: {problem}") };
-    if count > 1 {
-        Some(format!("{detail} {count} names need a change."))
-    } else {
-        Some(detail)
-    }
+    let shown = if name.trim().is_empty() { "" } else { name };
+    let detail = if shown.is_empty() { problem.to_string() } else { format!("{name}: {problem}") };
+    let line = if count > 1 { format!("{detail} {count} names need a change.") } else { detail };
+    Some((shown.to_string(), line))
 }
 
 /// Why this text cannot be a Windows file name. `None` means it is allowed.
@@ -70,7 +120,7 @@ pub fn filename_problem(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
         return Some("Type a file name.");
     }
-    if name.chars().any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')) {
+    if name.chars().any(is_invalid_char) {
         return Some("A file name cannot contain \\ / : * ? \" < > |.");
     }
     if name.ends_with(' ') || name.ends_with('.') {
@@ -293,6 +343,61 @@ mod tests {
         assert!(filename_problem("Song.").is_some());
         assert!(filename_problem("CON").is_some());
         assert!(filename_problem(" ").is_some());
+    }
+
+    #[test]
+    fn invalid_chars_are_the_ones_windows_rejects() {
+        for ch in ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '\u{7}', '\t', '\n', '\u{0}'] {
+            assert!(is_invalid_char(ch), "{ch:?}");
+        }
+        for ch in ['a', ' ', '.', '-', '(', ')', '\'', '\u{e9}', '\u{3042}'] {
+            assert!(!is_invalid_char(ch), "{ch:?}");
+        }
+        assert_eq!(sanitize("a:b?c"), "a_b_c");
+        assert!(filename_problem("a|b").is_some());
+    }
+
+    fn marked(name: &str) -> String {
+        name_marks(name)
+            .iter()
+            .map(|(ch, mark)| match mark {
+                Mark::Plain => ch.to_string(),
+                Mark::Bad => format!("[{ch}]"),
+                Mark::End => format!("{{{ch}}}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn marks_fall_on_the_characters_that_make_a_name_illegal() {
+        assert_eq!(marked("Good name"), "Good name");
+        assert_eq!(marked("Bad: name? <x>"), "Bad[:] name[?] [<]x[>]");
+        assert_eq!(marked("a/b\\c|d*e\"f"), "a[/]b[\\]c[|]d[*]e[\"]f");
+        assert_eq!(marked("Trailing period."), "Trailing period{.}");
+        assert_eq!(marked("Trailing space "), "Trailing space{\u{b7}}");
+        assert_eq!(marked("Ends in a star*"), "Ends in a star[*]");
+        assert_eq!(marked("Ctrl\u{7}char"), "Ctrl[\u{a4}]char");
+        assert_eq!(marked("1.5 inner dots. ok"), "1.5 inner dots. ok");
+        // Reserved and long names are a whole-name problem.
+        assert_eq!(marked("CON"), "CON");
+        assert_eq!(marked(&"x".repeat(300)), "x".repeat(300));
+        assert_eq!(marked("   "), "   ");
+        assert_eq!(marked(""), "");
+    }
+
+    #[test]
+    fn first_name_problem_gives_the_name_and_the_line() {
+        let items = vec![item("Fine", &[]), item("Bad?", &[]), item("Also bad.", &[])];
+        let (name, line) = first_name_problem(&items).unwrap();
+        assert_eq!(name, "Bad?");
+        assert!(line.starts_with("Bad?: "));
+        assert!(line.ends_with("2 names need a change."));
+        assert_eq!(name_problem_line(&items), Some(line));
+        let blank = vec![item(" ", &[])];
+        let (name, line) = first_name_problem(&blank).unwrap();
+        assert_eq!(name, "");
+        assert_eq!(line, "Type a file name.");
+        assert_eq!(first_name_problem(&[item("Fine", &[])]), None);
     }
 
     #[test]
