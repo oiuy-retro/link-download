@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use crate::classify::{self, Hit};
 use crate::commands::{self, Tags};
+use crate::jobs::Running;
 use crate::model::{Block, Group, Options};
 use crate::net;
+use crate::partial;
 use crate::paths;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -71,7 +73,7 @@ impl Live {
 pub struct Shared {
     pub live: Mutex<Live>,
     pub groups: Mutex<Option<Vec<Group>>>,
-    pub child: Mutex<Option<Child>>,
+    pub child: Mutex<Option<Running>>,
     pub cancel: AtomicBool,
 }
 
@@ -186,8 +188,18 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 journal(&format!("could not create {}: {err}", dir.display()));
                 continue;
             }
-            let stem = paths::download_stem(dir, &item.title);
-            let template = dir.join(format!("{stem}.%(ext)s")).display().to_string();
+            // yt-dlp downloads into a hidden folder inside the music folder, one
+            // folder per item (see partial.rs). Only the finished, tagged file is
+            // moved next to your music, so a Cancel never leaves .part, .ytdl or
+            // .f137 pieces there, and the move is a rename on the same drive.
+            let work = partial::item_dir(Path::new(&opts.location), row_id);
+            if let Err(err) = partial::prepare(Path::new(&opts.location)).and_then(|_| fs::create_dir_all(&work)) {
+                fail(&shared, row_id, &err.to_string());
+                journal(&format!("could not create {}: {err}", work.display()));
+                continue;
+            }
+            let stem = paths::download_stem(&work, &item.title);
+            let template = work.join(format!("{stem}.%(ext)s")).display().to_string();
             let mut saved = String::new();
             let mut outcome = DownloadOutcome::Retry;
             while outcome == DownloadOutcome::Retry {
@@ -256,7 +268,7 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 }
             }
             if outcome == DownloadOutcome::Ok {
-                if let Some(path) = resolve_download(dir, &stem, &saved) {
+                if let Some(path) = resolve_download(&work, &stem, &saved) {
                     item.temp_path = Some(path.display().to_string());
                     set_fraction(&shared, row_id, 1.0);
                     store_item(&shared, &ffmpeg, &opts, row_id, &path, item, dir, track_total, &album, &playlist_thumb);
@@ -339,13 +351,13 @@ fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, 
         Ok(_) => {}
     }
     set_convert(shared, row_id, 0.8);
-    let thumb = thumbnail_jpeg(shared, ffmpeg, dir, &own_thumb, row_id);
+    let thumb = thumbnail_jpeg(shared, ffmpeg, &partial::item_dir(Path::new(&opts.location), row_id), &own_thumb, row_id);
     let mut ready = tagged.clone();
     if let Some(ref thumb) = thumb {
         let cover = commands::cover_args(&tagged, thumb, &covered, opts.container, opts.audio_only);
         let covered_ok = run_command(shared, ffmpeg, &cover, Some(dir), false, |_| {}).map(|output| output.code == 0 && file_len(&covered) > 0).unwrap_or(false);
         if covered_ok && covered.is_file() {
-            ready = covered;
+            ready = covered.clone();
         } else {
             let _ = fs::remove_file(&covered);
             journal(&format!("saved without a cover: {title}"));
@@ -353,6 +365,15 @@ fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, 
     }
     if let Some(thumb) = &thumb {
         let _ = fs::remove_file(thumb);
+    }
+    if cancelled(shared) {
+        // Cancel came while the cover was being added. Remove the half-made
+        // files this step created; the download itself stays in the app's temp
+        // folder so pressing Download again can reuse it.
+        let _ = fs::remove_file(&tagged);
+        let _ = fs::remove_file(&covered);
+        fail(shared, row_id, "Stopped.");
+        return;
     }
     let destination = final_path(dir, &title, opts.container.extension(), source);
     if destination.as_path() == source {
@@ -371,6 +392,11 @@ fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, 
     }
     if ready.as_path() != destination.as_path() && ready != tagged {
         let _ = fs::remove_file(&ready);
+    }
+    // The item's folder in the hidden folder held only the download and the cover picture.
+    let work = partial::item_dir(Path::new(&opts.location), row_id);
+    if source.starts_with(&work) {
+        let _ = fs::remove_dir_all(&work);
     }
     journal(&format!("saved {}", destination.display()));
     set_convert(shared, row_id, 1.0);
@@ -394,6 +420,7 @@ fn thumbnail_jpeg(shared: &Shared, ffmpeg: &Path, dir: &Path, url: &str, id: u64
         return None;
     }
     let bytes = net::get(&url).ok()?;
+    fs::create_dir_all(dir).ok()?;
     let jpeg = dir.join(format!(".cover-{id}.jpg"));
     write_jpeg(ffmpeg, shared, &bytes, &jpeg).ok()?;
     Some(jpeg)
@@ -406,8 +433,9 @@ fn write_jpeg(ffmpeg: &Path, shared: &Shared, bytes: &[u8], dest: &Path) -> Resu
     }
     let raw = dest.with_extension("bin");
     fs::write(&raw, bytes).map_err(|err| err.to_string())?;
-    let output = run_command(shared, ffmpeg, &commands::jpeg_args(&raw, dest), None, false, |_| {})?;
+    let output = run_command(shared, ffmpeg, &commands::jpeg_args(&raw, dest), None, false, |_| {});
     let _ = fs::remove_file(&raw);
+    let output = output?;
     if output.code != 0 || !dest.is_file() {
         return Err(tail(&output.log));
     }
@@ -550,7 +578,16 @@ where
     let mut child = command.spawn().map_err(|err| format!("Could not start {}: {err}", exe.display()))?;
     let stdout = child.stdout.take().ok_or_else(|| "No output pipe.".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "No error pipe.".to_string())?;
-    *shared.child.lock().expect("child") = Some(child);
+    {
+        let mut slot = shared.child.lock().expect("child");
+        let mut running = Running::new(child);
+        // Cancel may have been pressed between the check above and now, when
+        // there was nothing to stop yet.
+        if cancelled(shared) {
+            running.kill_tree();
+        }
+        *slot = Some(running);
+    }
     let log = Arc::new(Mutex::new(String::new()));
     let stdout_text = Arc::new(Mutex::new(String::new()));
     let filepath = Arc::new(Mutex::new(String::new()));
@@ -584,8 +621,18 @@ where
             push_log(&log_out, &line);
         });
     });
-    let status = shared.child.lock().expect("child").as_mut().and_then(|child| child.wait().ok());
-    *shared.child.lock().expect("child") = None;
+    let status = wait_for_exit(shared);
+    // Dropping the job closes it, which also ends anything the program left running.
+    drop(shared.child.lock().expect("child").take());
+    if cancelled(shared) {
+        // After a Cancel, don't wait forever for output from a program that
+        // somehow escaped the job; give the readers a moment and move on.
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !(stdout_thread.is_finished() && stderr_thread.is_finished()) && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        return Err("Stopped.".into());
+    }
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     if cancelled(shared) {
@@ -597,6 +644,27 @@ where
     let found = filepath.lock().expect("path").clone();
     journal_command(exe, args, code, &log_text);
     Ok(RunOut { code, log: log_text, stdout, filepath: found })
+}
+
+/// Waits for the running program to end. The lock is only held for a quick check
+/// every 50 ms, never while waiting, so Cancel can always get in and stop it.
+/// (It used to hold the lock for the whole download, so Cancel froze the window
+/// until the song finished.)
+fn wait_for_exit(shared: &Shared) -> Option<std::process::ExitStatus> {
+    loop {
+        {
+            let mut slot = shared.child.lock().expect("child");
+            match slot.as_mut() {
+                Some(running) => match running.child.try_wait() {
+                    Ok(Some(status)) => return Some(status),
+                    Ok(None) => {}
+                    Err(_) => return None,
+                },
+                None => return None,
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn journal(text: &str) {
@@ -705,6 +773,9 @@ fn reset(shared: &Shared) {
 }
 
 fn finish(shared: &Shared, groups: Vec<Group>, error: &str) {
+    // This run's part of the hidden folder is removed, except finished downloads
+    // that still wait to be converted.
+    partial::clean_up(&waiting_files(&groups));
     *shared.groups.lock().expect("groups") = Some(groups);
     let mut live = shared.live.lock().expect("live");
     live.current_bytes = 0;
@@ -717,6 +788,23 @@ fn finish(shared: &Shared, groups: Vec<Group>, error: &str) {
         live.status = "Done.".into();
     }
     live.done = true;
+}
+
+/// Finished downloads that still wait to be converted. Pressing Download again
+/// uses them, so their folders are kept.
+fn waiting_files(groups: &[Group]) -> Vec<PathBuf> {
+    groups
+        .iter()
+        .flat_map(|group| group.items.iter())
+        .filter_map(|item| item.temp_path.as_ref())
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// When the app closes, its folders in the hidden folder are removed completely.
+pub fn discard_partial() {
+    partial::discard_all();
 }
 
 fn set_status(shared: &Shared, text: &str) {
@@ -814,10 +902,12 @@ fn tail(text: &str) -> String {
         .collect()
 }
 
+/// Cancel: stops the running program and everything it started. Returns at once;
+/// the worker notices the cancel flag and winds down by itself.
 pub fn kill_child(shared: &Shared) {
     shared.cancel.store(true, Ordering::Relaxed);
-    if let Some(child) = shared.child.lock().expect("child").as_mut() {
-        let _ = child.kill();
+    if let Some(running) = shared.child.lock().expect("child").as_mut() {
+        running.kill_tree();
     }
 }
 
@@ -849,6 +939,57 @@ mod tests {
         let lines = lines_of(out);
         assert_eq!(lines.len(), 1);
         assert_eq!(commands::parse_after_move(&lines[0]), None);
+    }
+
+    /// Starts `cmd /c cmd /c loop.bat` so the loop runs in a grandchild, like ffmpeg
+    /// under yt-dlp. The loop appends a line to `file` about ten times a second.
+    fn start_writer(shared: &Arc<Shared>, file: &Path) -> thread::JoinHandle<Result<RunOut, String>> {
+        let shared = Arc::clone(shared);
+        let script = file.with_extension("bat");
+        fs::write(
+            &script,
+            format!("@echo off\r\nfor /l %%i in (1,1,600) do (\r\necho x>>{}\r\nping -n 1 -w 100 192.0.2.1 >nul\r\n)\r\n", file.display()),
+        )
+        .unwrap();
+        // cmd starts a second cmd that runs the loop, so the loop is a grandchild.
+        let args = vec!["/c".to_string(), "cmd".into(), "/c".into(), script.display().to_string()];
+        thread::spawn(move || run_command(&shared, Path::new("cmd.exe"), &args, None, false, |_| {}))
+    }
+
+    #[test]
+    fn cancel_returns_at_once_and_stops_the_whole_tree() {
+        let file = std::env::temp_dir().join(format!("ld-cancel-test-{}.txt", std::process::id()));
+        let _ = fs::remove_file(&file);
+        let shared = Shared::new();
+        let worker = start_writer(&shared, &file);
+        let started = std::time::Instant::now();
+        while file_len(&file) == 0 && started.elapsed() < Duration::from_secs(20) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(file_len(&file) > 0, "the test program never started");
+        let pressed = std::time::Instant::now();
+        kill_child(&shared);
+        assert!(pressed.elapsed() < Duration::from_millis(500), "Cancel waited {:?}", pressed.elapsed());
+        let result = worker.join().unwrap();
+        assert_eq!(result.err().as_deref(), Some("Stopped."));
+        assert!(pressed.elapsed() < Duration::from_secs(5), "stopping took {:?}", pressed.elapsed());
+        thread::sleep(Duration::from_millis(500));
+        let after = file_len(&file);
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(file_len(&file), after, "the grandchild kept running after Cancel");
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_file(file.with_extension("bat"));
+    }
+
+    #[test]
+    fn cancel_before_the_program_starts_still_stops_it() {
+        let shared = Shared::new();
+        shared.cancel.store(true, Ordering::Relaxed);
+        let args = vec!["/c".to_string(), "ping -n 30 127.0.0.1 >nul".into()];
+        let started = std::time::Instant::now();
+        let result = run_command(&shared, Path::new("cmd.exe"), &args, None, false, |_| {});
+        assert_eq!(result.err().as_deref(), Some("Stopped."));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     fn out(code: i32, stdout: &str, log: &str) -> RunOut {
