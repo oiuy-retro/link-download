@@ -198,20 +198,29 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 }
                 let args = commands::download_args(&opts, &item.download_url, item.playlist_item, &template, &node, &ffmpeg_dir);
                 let shared_progress = shared.clone();
+                // Fresh for each attempt, so a retry counts from the start again.
+                let mut tracker = commands::ItemProgress::default();
                 let result = run_command(&shared, &ytdlp, &args, Some(&ffmpeg_dir), false, move |line| {
+                    if let Some(bytes) = commands::parse_expected_bytes(line) {
+                        tracker.expect(bytes);
+                        return;
+                    }
                     if let Some(progress) = commands::parse_progress(line) {
+                        tracker.update(&progress);
+                        let copied = tracker.copied();
+                        let size = tracker.size();
                         let mut live = shared_progress.live.lock().expect("live");
-                        if progress.downloaded > 0 {
-                            live.current_bytes = progress.downloaded;
+                        if copied > 0 {
+                            live.current_bytes = copied;
                         }
                         if let Some(row) = live.rows.iter_mut().find(|row| row.id == row_id) {
-                            if progress.downloaded > 0 {
-                                row.copied = progress.downloaded;
+                            if copied > 0 {
+                                row.copied = copied;
                             }
-                            if let Some(total) = progress.total {
-                                row.size = total;
+                            if size > 0 {
+                                row.size = size;
                             }
-                            if let Some(fraction) = progress.fraction {
+                            if let Some(fraction) = tracker.fraction() {
                                 row.fraction = fraction;
                             }
                         }

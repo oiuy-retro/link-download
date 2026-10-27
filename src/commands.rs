@@ -9,6 +9,10 @@ use crate::model::{AudioCodec, AudioQuality, Container, Options, Resolution, Vid
 pub const PROGRESS_TEMPLATE: &str =
     "download:download:%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s";
 
+/// Printed once per video before the download starts. For a video with separate
+/// video and audio parts, yt-dlp gives the size of both parts together here.
+pub const EXPECTED_PRINT: &str = "before_dl:expected_bytes:%(filesize,filesize_approx)s";
+
 pub const SPONSORBLOCK_REMOVE: &str = "sponsor,selfpromo,interaction";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +31,91 @@ pub struct Progress {
     pub speed: Option<f64>,
     /// 0 to 1 when the line gives a percent or a byte count.
     pub fraction: Option<f64>,
+    /// The current part is complete.
+    pub finished: bool,
+}
+
+/// Progress for one video across all of its parts, for one download attempt.
+/// yt-dlp fetches the video and audio of a video as separate parts, and each
+/// part counts from 0 again. This keeps a running total so the bar only moves forward.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ItemProgress {
+    /// Bytes of the parts that have finished.
+    banked: u64,
+    downloaded: u64,
+    part_total: Option<u64>,
+    /// Size of all parts together, when yt-dlp knows it.
+    expected: Option<u64>,
+    fraction: Option<f64>,
+}
+
+impl ItemProgress {
+    pub fn expect(&mut self, bytes: u64) {
+        if bytes > 0 {
+            self.expected = Some(bytes);
+        }
+    }
+
+    pub fn update(&mut self, progress: &Progress) {
+        if progress.downloaded == 0 && progress.total.is_none() {
+            // A line with only a percent. It is only right while there is one part.
+            if self.banked == 0 && self.expected.is_none() {
+                if let Some(fraction) = progress.fraction {
+                    self.raise(fraction);
+                }
+            }
+            return;
+        }
+        if progress.downloaded < self.downloaded {
+            // The count went back down, so a new part started without a finished line.
+            self.bank();
+        }
+        self.downloaded = progress.downloaded;
+        if progress.total.is_some() {
+            self.part_total = progress.total;
+        }
+        let sized = self.part_total.is_some() || self.expected.is_some();
+        if progress.finished {
+            self.bank();
+        }
+        if sized {
+            let size = self.size();
+            if size > 0 {
+                self.raise(self.copied() as f64 / size as f64);
+            }
+        }
+    }
+
+    /// Bytes downloaded so far, across all parts.
+    pub fn copied(&self) -> u64 {
+        self.banked.saturating_add(self.downloaded)
+    }
+
+    /// Expected size of all parts, or 0 when nothing is known yet.
+    pub fn size(&self) -> u64 {
+        let known = match self.part_total {
+            Some(total) => self.banked.saturating_add(total.max(self.downloaded)),
+            None if self.banked > 0 => self.copied(),
+            None => 0,
+        };
+        known.max(self.expected.unwrap_or(0))
+    }
+
+    pub fn fraction(&self) -> Option<f64> {
+        self.fraction
+    }
+
+    fn bank(&mut self) {
+        let part = self.part_total.unwrap_or(0).max(self.downloaded);
+        self.banked = self.banked.saturating_add(part);
+        self.downloaded = 0;
+        self.part_total = None;
+    }
+
+    fn raise(&mut self, fraction: f64) {
+        let fraction = fraction.clamp(0.0, 1.0);
+        self.fraction = Some(self.fraction.map_or(fraction, |old| old.max(fraction)));
+    }
 }
 
 pub fn tool_args(node: &Path, ffmpeg_dir: &Path) -> Vec<String> {
@@ -87,6 +176,8 @@ pub fn download_args(opts: &Options, url: &str, playlist_item: Option<u32>, outp
         output_template.into(),
         "--progress-template".into(),
         PROGRESS_TEMPLATE.into(),
+        "--print".into(),
+        EXPECTED_PRINT.into(),
         "--print".into(),
         "after_move:%(filepath)s".into(),
         // `--print` implies quiet, and quiet hides the progress bar unless this is set.
@@ -443,6 +534,7 @@ pub fn parse_progress(line: &str) -> Option<Progress> {
         total: None,
         speed: None,
         fraction: Some((percent / 100.0).clamp(0.0, 1.0)),
+        finished: false,
     })
 }
 
@@ -467,7 +559,11 @@ fn pipe_progress(rest: &str) -> Option<Progress> {
             }
         }
     }
-    Some(Progress { downloaded, total, speed: number_f64(parts[4]), fraction })
+    Some(Progress { downloaded, total, speed: number_f64(parts[4]), fraction, finished: status == "finished" })
+}
+
+pub fn parse_expected_bytes(line: &str) -> Option<u64> {
+    number_u64(line.trim().strip_prefix("expected_bytes:")?).filter(|bytes| *bytes > 0)
 }
 
 pub fn parse_after_move(line: &str) -> Option<String> {
@@ -617,11 +713,84 @@ mod tests {
         assert_eq!(progress.total, Some(4096));
         assert_eq!(progress.speed, Some(2048.0));
         assert_eq!(progress.fraction, Some(0.375));
+        assert!(!progress.finished);
+        assert!(parse_progress("download:finished|4096|4096|NA|2048").unwrap().finished);
         let stripped = parse_progress("downloading|1536|4096|NA|2048").unwrap();
         assert_eq!(stripped.fraction, Some(0.375));
         assert_eq!(parse_progress("[download]  12.5% of 10.00MiB at 1.00MiB/s").unwrap().fraction, Some(0.125));
         assert_eq!(parse_after_move("after_move:C:\\Temp\\a.mkv").as_deref(), Some("C:\\Temp\\a.mkv"));
         assert_eq!(parse_out_time_ms("out_time_ms=1500000"), Some(1_500_000));
+    }
+
+    fn feed(tracker: &mut ItemProgress, line: &str) -> (u64, u64, f64) {
+        if line.starts_with("expected_bytes:") {
+            if let Some(bytes) = parse_expected_bytes(line) {
+                tracker.expect(bytes);
+            }
+        } else {
+            tracker.update(&parse_progress(line).unwrap());
+        }
+        (tracker.copied(), tracker.size(), tracker.fraction().unwrap_or(0.0))
+    }
+
+    #[test]
+    fn video_and_audio_parts_add_up_without_going_back() {
+        let mut tracker = ItemProgress::default();
+        assert_eq!(feed(&mut tracker, "expected_bytes:1000"), (0, 1000, 0.0));
+        assert_eq!(feed(&mut tracker, "download:downloading|400|800|NA|10"), (400, 1000, 0.4));
+        assert_eq!(feed(&mut tracker, "download:finished|800|800|NA|10"), (800, 1000, 0.8));
+        // The audio part starts counting from 0 again.
+        assert_eq!(feed(&mut tracker, "download:downloading|0|200|NA|NA"), (800, 1000, 0.8));
+        assert_eq!(feed(&mut tracker, "download:downloading|100|200|NA|10"), (900, 1000, 0.9));
+        assert_eq!(feed(&mut tracker, "download:finished|200|200|NA|10"), (1000, 1000, 1.0));
+    }
+
+    #[test]
+    fn parts_add_up_without_an_expected_size() {
+        let mut tracker = ItemProgress::default();
+        assert_eq!(feed(&mut tracker, "download:downloading|300|600|NA|10"), (300, 600, 0.5));
+        assert_eq!(feed(&mut tracker, "download:finished|600|600|NA|10"), (600, 600, 1.0));
+        // The second part's size was not known in advance, so the bar holds
+        // instead of dropping, and the byte counts keep growing.
+        assert_eq!(feed(&mut tracker, "download:downloading|100|400|NA|10"), (700, 1000, 1.0));
+        assert_eq!(feed(&mut tracker, "download:finished|400|400|NA|10"), (1000, 1000, 1.0));
+    }
+
+    #[test]
+    fn a_count_that_drops_starts_a_new_part() {
+        let mut tracker = ItemProgress::default();
+        tracker.expect(1000);
+        assert_eq!(feed(&mut tracker, "download:downloading|700|700|NA|10"), (700, 1000, 0.7));
+        assert_eq!(feed(&mut tracker, "download:downloading|50|300|NA|10"), (750, 1000, 0.75));
+    }
+
+    #[test]
+    fn single_part_progress_is_unchanged() {
+        let mut tracker = ItemProgress::default();
+        assert_eq!(feed(&mut tracker, "expected_bytes:NA"), (0, 0, 0.0));
+        assert_eq!(feed(&mut tracker, "download:downloading|1536|4096|NA|2048"), (1536, 4096, 0.375));
+        assert_eq!(feed(&mut tracker, "download:finished|4096|4096|NA|2048"), (4096, 4096, 1.0));
+        let mut percent = ItemProgress::default();
+        assert_eq!(feed(&mut percent, "[download]  12.5% of 10.00MiB at 1.00MiB/s"), (0, 0, 0.125));
+        assert_eq!(feed(&mut percent, "[download]  10.0% of 10.00MiB at 1.00MiB/s"), (0, 0, 0.125));
+    }
+
+    #[test]
+    fn already_downloaded_part_counts_its_size() {
+        let mut tracker = ItemProgress::default();
+        tracker.expect(1000);
+        assert_eq!(feed(&mut tracker, "download:finished|NA|800|NA|NA"), (800, 1000, 0.8));
+        assert_eq!(feed(&mut tracker, "download:downloading|100|200|NA|10"), (900, 1000, 0.9));
+    }
+
+    #[test]
+    fn expected_bytes_lines_parse() {
+        assert_eq!(parse_expected_bytes("expected_bytes:437474"), Some(437474));
+        assert_eq!(parse_expected_bytes("expected_bytes:123.7"), Some(123));
+        assert_eq!(parse_expected_bytes("expected_bytes:NA"), None);
+        assert_eq!(parse_expected_bytes("expected_bytes:0"), None);
+        assert_eq!(parse_expected_bytes("download:downloading|1|2|NA|3"), None);
+        assert!(parse_progress("expected_bytes:437474").is_none());
     }
 
     #[test]
@@ -635,6 +804,7 @@ mod tests {
             Path::new("C:\\tools"),
         );
         assert!(args.windows(2).any(|pair| pair[0] == "--progress-template" && pair[1] == PROGRESS_TEMPLATE));
+        assert!(args.windows(2).any(|pair| pair[0] == "--print" && pair[1] == EXPECTED_PRINT));
         assert!(PROGRESS_TEMPLATE.starts_with("download:download:"));
         let print_at = args.iter().position(|arg| arg == "--print").unwrap();
         let progress_at = args.iter().position(|arg| arg == "--progress").unwrap();
