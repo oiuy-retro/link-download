@@ -2,9 +2,9 @@
 
 Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/issues) tab.
 
-## Text fields ignore Windows shortcuts
+## Location accepts a bare name
 
-[#18](https://github.com/oiuy-retro/link-download/issues/18). Ctrl+A does nothing in most text boxes and plays the Windows error sound. Ctrl+Backspace and Ctrl+Delete should work in every box, not only Remove / Insert / Find.
+[#19](https://github.com/oiuy-retro/link-download/issues/19). A Location such as `ds` is turned into a folder next to the program. It should be a full folder path.
 
 ## Custom mouse cursor
 

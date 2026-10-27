@@ -188,12 +188,11 @@ fn album_folder(group: &Group) -> Option<String> {
 ///
 /// - Spaces around it and one pair of surrounding quotes are removed, so a path
 ///   pasted with Explorer's "Copy as path" works.
-/// - A relative path such as `Music` or `.\\Music` becomes a full path. Without
-///   this the app, yt-dlp and ffmpeg each read it from a different starting
-///   folder, and the downloads and conversions failed.
-/// - `/` becomes `\\`, and `.` and `..` are resolved.
+/// - `%NAME%` is replaced with that environment variable.
+/// - `/` becomes `\\`, and `.` and `..` are resolved on a full path.
 ///
-/// An empty box stays empty. Next is already greyed out for that.
+/// A bare name such as `ds` is not a location: it used to become a folder next
+/// to the program. An empty box stays empty. Next is already greyed out for that.
 pub fn clean_location(text: &str) -> Result<String, String> {
     let mut text = text.trim();
     for quote in ['"', '\''] {
@@ -205,17 +204,64 @@ pub fn clean_location(text: &str) -> Result<String, String> {
     if text.is_empty() {
         return Ok(String::new());
     }
+    let typed = text;
+    let expanded = expand_env_vars(typed)?;
     let bad = |part: &str| part.chars().find(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*') || (*c as u32) < 32);
-    for part in Path::new(text).components() {
+    for part in Path::new(&expanded).components() {
         if let std::path::Component::Normal(name) = part {
             if let Some(c) = bad(&name.to_string_lossy()) {
                 let shown = if (c as u32) < 32 { "a control character".to_string() } else { format!("\"{c}\"") };
-                return Err(format!("The Location \"{text}\" can't be used: folder names can't contain {shown}."));
+                return Err(format!("The Location \"{typed}\" can't be used: folder names can't contain {shown}."));
             }
         }
     }
-    let full = std::path::absolute(text).map_err(|err| format!("The Location \"{text}\" can't be used as a folder: {err}."))?;
+    if !Path::new(&expanded).is_absolute() {
+        return Err(format!(
+            "The Location \"{typed}\" needs a full folder path, such as C:\\Music."
+        ));
+    }
+    let full = std::path::absolute(&expanded)
+        .map_err(|err| format!("The Location \"{typed}\" can't be used as a folder: {err}."))?;
     Ok(full.display().to_string())
+}
+
+/// `%NAME%` becomes that variable's value. `%%` is one `%`. An unknown name is an error.
+fn expand_env_vars(text: &str) -> Result<String, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 < chars.len() && chars[i + 1] == '%' {
+            out.push('%');
+            i += 2;
+            continue;
+        }
+        let rest = &chars[i + 1..];
+        if let Some(end) = rest.iter().position(|&c| c == '%') {
+            let name: String = rest[..end].iter().collect();
+            if name.is_empty() {
+                out.push('%');
+                i += 1;
+                continue;
+            }
+            match std::env::var(&name) {
+                Ok(value) => out.push_str(&value),
+                Err(_) => {
+                    return Err(format!("The Location \"{text}\" can't be used: %{name}% is not set."));
+                }
+            }
+            i += end + 2;
+        } else {
+            out.push('%');
+            i += 1;
+        }
+    }
+    Ok(out)
 }
 
 /// The `-o` value for yt-dlp: the folder, then the file name with the
@@ -417,12 +463,28 @@ mod tests {
 
     #[test]
     fn location_becomes_a_full_path() {
-        let full = clean_location("Music").unwrap();
-        assert!(Path::new(&full).is_absolute(), "{full}");
-        assert!(full.ends_with("\\Music"), "{full}");
         assert_eq!(clean_location("C:/Music/Rock/../Pop").unwrap(), "C:\\Music\\Pop");
         assert_eq!(clean_location("C:\\Music\\.\\Pop").unwrap(), "C:\\Music\\Pop");
         assert_eq!(clean_location("\\\\server\\share\\Music").unwrap(), "\\\\server\\share\\Music");
+    }
+
+    #[test]
+    fn a_bare_name_is_not_a_location() {
+        let err = clean_location("ds").unwrap_err();
+        assert!(err.contains("full folder path"), "{err}");
+        assert!(clean_location("Music").is_err());
+        assert!(clean_location(".\\Music").is_err());
+        assert!(clean_location("..\\Music").is_err());
+    }
+
+    #[test]
+    fn env_vars_in_the_location_are_expanded() {
+        let full = clean_location("%SystemDrive%\\Music").unwrap();
+        assert!(Path::new(&full).is_absolute(), "{full}");
+        assert!(full.ends_with("\\Music"), "{full}");
+        assert!(!full.contains('%'), "{full}");
+        let err = clean_location("%NOT_A_REAL_LINK_DOWNLOAD_VAR%\\Music").unwrap_err();
+        assert!(err.contains("NOT_A_REAL_LINK_DOWNLOAD_VAR"), "{err}");
     }
 
     #[test]
