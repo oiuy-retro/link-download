@@ -48,7 +48,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
     GetAncestor, GetClassNameW, GetCursorPos, GetScrollInfo, GA_ROOT, GetDlgItem, GetMessageW, GetParent, GetSystemMetrics, GetWindow,
-    PostMessageW, WM_APP,
+    PostMessageW, WM_APP, IsChild, IsWindow,
     GetWindowLongPtrW, GetWindowRect, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadImageW,
     MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, BM_GETCHECK, BM_SETCHECK,
@@ -255,6 +255,8 @@ struct App {
     cap_press: CapHot,
     /// The file name being typed in a Names list, and what it was before typing started.
     live_edit: Option<LiveEdit>,
+    /// The control that had the keyboard focus when the window was last deactivated.
+    last_focus: HWND,
 }
 
 /// One file name being edited in place. `original` is put back when the edit is cancelled with Esc.
@@ -833,6 +835,7 @@ impl App {
             cap_hot: CapHot::None,
             cap_press: CapHot::None,
             live_edit: None,
+            last_focus: HWND(std::ptr::null_mut()),
         }
     }
 
@@ -869,7 +872,22 @@ impl App {
             x if x == WM_NCHITTEST => self.hit_test(lparam),
             x if x == WM_ACTIVATE => {
                 self.active = (wparam.0 & 0xFFFF) != 0;
+                let minimized = (wparam.0 >> 16) & 0xFFFF != 0;
+                if self.active {
+                    // A popup, the folder picker or Alt+Tab took the window away. Give the
+                    // keyboard back to the box it was in, like a dialog does.
+                    if !minimized {
+                        self.restore_focus();
+                    }
+                } else {
+                    self.remember_focus();
+                }
                 self.invalidate_caption();
+                Action::None
+            }
+            0x0007 => {
+                // WM_SETFOCUS on the main window itself, such as after a restore from the taskbar.
+                self.restore_focus();
                 Action::None
             }
             x if x == WM_MOUSEMOVE => self.cap_move(lparam),
@@ -1878,6 +1896,27 @@ impl App {
         self.groups.iter().any(|group| group.items.iter().any(|item| item.temp_path.is_some()))
     }
 
+    fn remember_focus(&mut self) {
+        let focus = unsafe { GetFocus() };
+        if !focus.0.is_null() && focus != self.hwnd && unsafe { IsChild(self.hwnd, focus).as_bool() } {
+            self.last_focus = focus;
+        }
+    }
+
+    fn restore_focus(&mut self) {
+        let target = self.last_focus;
+        if target.0.is_null() {
+            return;
+        }
+        let alive = unsafe { IsWindow(target).as_bool() && IsChild(self.hwnd, target).as_bool() };
+        if !alive || !enabled_visible(target) {
+            // The page was rebuilt since, or the control was turned off.
+            self.last_focus = HWND(std::ptr::null_mut());
+            return;
+        }
+        unsafe { let _ = SetFocus(target); }
+    }
+
     fn on_command(&mut self, wparam: WPARAM, lparam: LPARAM) -> Action {
         let id = (wparam.0 & 0xFFFF) as i32;
         let code = ((wparam.0 >> 16) & 0xFFFF) as u16;
@@ -1924,7 +1963,7 @@ impl App {
                 self.refill_containers();
             }
             if matches!(id, ID_RES | ID_VCODEC | ID_AQUAL | ID_ACODEC | ID_CONTAINER | ID_AUDIO | ID_REENCODE | ID_SPONSORBLOCK | ID_STRIP_GENRE | ID_MIN | ID_MAX | ID_LOCATION) {
-                self.note_options(true);
+                self.note_options(popup_for(id, code, self.leaving_for_own_control()));
             }
         }
         if self.page == 1 && id == ID_LINKS && code == EN_CHANGE as u16 {
@@ -2080,6 +2119,9 @@ impl App {
                     if text.is_empty() {
                         return Action::None;
                     }
+                    // Leaving a text box for Next may have queued the same message. Show it once.
+                    PENDING.with(|cell| cell.borrow_mut().take());
+                    self.last_notice = text.clone();
                     return Action::Popup(text);
                 }
                 match tools::load_bundle() {
@@ -2251,6 +2293,13 @@ impl App {
         } else if text.is_empty() {
             self.last_notice.clear();
         }
+    }
+
+    /// True when the focus is moving to another control of this window, and not to
+    /// another program. Checked while a text box is losing the focus.
+    fn leaving_for_own_control(&self) -> bool {
+        let focus = unsafe { GetFocus() };
+        !focus.0.is_null() && unsafe { IsChild(self.hwnd, focus).as_bool() }
     }
 
     fn defer_popup(&mut self, text: String) {
@@ -2863,6 +2912,17 @@ impl App {
 
 thread_local! {
     static PENDING: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Whether a change on the Options page may explain a problem in a popup.
+/// Drop-downs and check boxes explain right away. A text box only explains once you
+/// leave it for another control here, never on a keystroke, so a half-typed number
+/// such as the 1 of 12 does not interrupt you. Next always explains.
+fn popup_for(id: i32, code: u16, leaving_for_own_control: bool) -> bool {
+    if matches!(id, ID_MIN | ID_MAX | ID_LOCATION) {
+        return code == EN_KILLFOCUS as u16 && leaving_for_own_control;
+    }
+    code != EN_CHANGE as u16 && code != EN_KILLFOCUS as u16
 }
 
 fn speed_of(app: &App) -> (f64, f64) {
@@ -4442,5 +4502,33 @@ mod text_key_tests {
         assert!(!is_tool_field(ID_MODE));
         assert!(!is_tool_field(ID_STRIP));
         assert!(!is_tool_field(22000));
+    }
+}
+
+#[cfg(test)]
+mod typing_popup_tests {
+    use super::{popup_for, CBN_SELCHANGE, EN_CHANGE, EN_KILLFOCUS, ID_AUDIO, ID_LOCATION, ID_MAX, ID_MIN, ID_RES};
+
+    #[test]
+    fn typing_in_a_box_never_pops_up() {
+        for id in [ID_MIN, ID_MAX, ID_LOCATION] {
+            assert!(!popup_for(id, EN_CHANGE as u16, true));
+            assert!(!popup_for(id, EN_CHANGE as u16, false));
+        }
+    }
+
+    #[test]
+    fn leaving_a_box_for_another_control_explains() {
+        for id in [ID_MIN, ID_MAX, ID_LOCATION] {
+            assert!(popup_for(id, EN_KILLFOCUS as u16, true));
+            // Alt+Tab to another program is not "done with the box".
+            assert!(!popup_for(id, EN_KILLFOCUS as u16, false));
+        }
+    }
+
+    #[test]
+    fn drop_downs_and_check_boxes_still_explain_at_once() {
+        assert!(popup_for(ID_RES, CBN_SELCHANGE as u16, true));
+        assert!(popup_for(ID_AUDIO, 0, true));
     }
 }
