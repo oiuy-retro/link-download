@@ -27,6 +27,8 @@ pub enum RowKind {
     Waiting,
     Pinned,
     Failed,
+    /// The finished file was already in the folder, so nothing was downloaded.
+    Saved,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +146,10 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
     }
     let mut rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1);
     let mut seen = 0u32;
+    // Finished-file paths that items of this run are heading for. Two items with
+    // the same title in the same folder must not make the second one look
+    // "Already saved" because the first one just made that file.
+    let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for group in groups.iter_mut() {
         let source_url = group.source_url.clone();
         let dirs: Vec<PathBuf> = (0..group.items.len())
@@ -172,10 +178,26 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             if item.blocked.is_some() || (item.download_url.is_empty() && item.playlist_item.is_none()) {
                 continue;
             }
+            let finished = paths::final_file(&dirs[index], &item.title, opts.container.extension());
+            // A download from earlier in this session that still waits to be
+            // converted is used as before. After a successful save that file is
+            // gone, so pressing Download again finds the song already saved.
+            let waiting = item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false);
+            let mine_earlier = claimed.contains(&finished);
+            // "Overwrite files already saved": download again and replace exactly
+            // this file once the new one is finished. Never when the file was made
+            // earlier in this run by another song with the same title.
+            let replace = opts.overwrite && !mine_earlier && finished.is_file();
+            if !opts.overwrite && !waiting && !mine_earlier && finished.is_file() {
+                already_saved(&shared, row_id);
+                journal(&format!("already saved, skipped {}", finished.display()));
+                continue;
+            }
+            claimed.insert(finished);
             if let Some(path) = item.temp_path.clone() {
                 if Path::new(&path).is_file() {
                     set_fraction(&shared, row_id, 1.0);
-                    store_item(&shared, &ffmpeg, &opts, row_id, Path::new(&path), item, &dirs[index], track_total, &album, &playlist_thumb);
+                    store_item(&shared, &ffmpeg, &opts, row_id, Path::new(&path), item, &dirs[index], track_total, &album, &playlist_thumb, replace);
                     continue;
                 }
             }
@@ -199,6 +221,9 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 continue;
             }
             let stem = paths::download_stem(&work, &item.title);
+            // What was in the work folder before yt-dlp ran. Only a file that is not
+            // in this list can be the new download.
+            let before = folder_names(&work);
             let template = work.join(format!("{stem}.%(ext)s")).display().to_string();
             let mut saved = String::new();
             let mut outcome = DownloadOutcome::Retry;
@@ -268,10 +293,10 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 }
             }
             if outcome == DownloadOutcome::Ok {
-                if let Some(path) = resolve_download(&work, &stem, &saved) {
+                if let Some(path) = resolve_download(&work, &stem, &saved, &before) {
                     item.temp_path = Some(path.display().to_string());
                     set_fraction(&shared, row_id, 1.0);
-                    store_item(&shared, &ffmpeg, &opts, row_id, &path, item, dir, track_total, &album, &playlist_thumb);
+                    store_item(&shared, &ffmpeg, &opts, row_id, &path, item, dir, track_total, &album, &playlist_thumb, replace);
                     fetched_now = true;
                 } else {
                     fail(&shared, row_id, "The download finished without a file.");
@@ -296,7 +321,7 @@ enum DownloadOutcome {
     Failed,
 }
 
-fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, source: &Path, item: &crate::model::Item, dir: &Path, track_total: Option<u32>, album: &str, playlist_thumb: &str) {
+fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, source: &Path, item: &crate::model::Item, dir: &Path, track_total: Option<u32>, album: &str, playlist_thumb: &str, replace: bool) {
     if cancelled(shared) {
         return;
     }
@@ -375,7 +400,10 @@ fn store_item(shared: &Arc<Shared>, ffmpeg: &Path, opts: &Options, row_id: u64, 
         fail(shared, row_id, "Stopped.");
         return;
     }
-    let destination = final_path(dir, &title, opts.container.extension(), source);
+    // With `replace`, the finished file takes the old file's name. The old file is
+    // only replaced here, by the final move, after the new one is complete, so a
+    // Cancel or a failure before this point leaves it as it was.
+    let destination = final_path(dir, &title, opts.container.extension(), source, replace);
     if destination.as_path() == source {
         let _ = fs::remove_file(source);
     }
@@ -530,19 +558,35 @@ fn row_id_url(source_url: &str, index: usize) -> u64 {
     value ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-fn resolve_download(temp: &Path, stem: &str, printed: &str) -> Option<PathBuf> {
+fn folder_names(dir: &Path) -> std::collections::HashSet<std::ffi::OsString> {
+    fs::read_dir(dir).map(|entries| entries.flatten().map(|entry| entry.file_name()).collect()).unwrap_or_default()
+}
+
+/// Finds the file yt-dlp just made. It uses the path yt-dlp printed when there is
+/// one. Otherwise it looks for exactly `stem.ext` (not "stem (Live).ext", not a
+/// leftover piece like `stem.f137.mp4`). Either way the file must be new: a name
+/// that was already in the folder before the download (`before`) is never used.
+fn resolve_download(dir: &Path, stem: &str, printed: &str, before: &std::collections::HashSet<std::ffi::OsString>) -> Option<PathBuf> {
+    let is_new = |path: &Path| {
+        let in_dir = path.parent().map(|parent| parent == dir).unwrap_or(false);
+        let existed = path.file_name().map(|name| before.contains(name)).unwrap_or(true);
+        !(in_dir && existed)
+    };
     let printed = printed.trim().trim_matches('"');
     if !printed.is_empty() {
         let path = PathBuf::from(printed);
-        if path.is_file() {
+        if path.is_file() && is_new(&path) {
             return Some(path);
         }
     }
     let mut best: Option<(u64, PathBuf)> = None;
-    let entries = fs::read_dir(temp).ok()?;
+    let entries = fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(stem) || name.ends_with(".part") {
+        if name == paths::PARTIAL_DIR || !paths::is_download_of(&name, stem) || before.contains(&entry.file_name()) {
+            continue;
+        }
+        if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
             continue;
         }
         let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -691,12 +735,12 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-fn final_path(dir: &Path, title: &str, extension: &str, source: &Path) -> PathBuf {
-    let wanted = dir.join(format!("{}.{}", paths::sanitize(title), extension));
-    if wanted.as_path() == source || !wanted.exists() {
+fn final_path(dir: &Path, title: &str, extension: &str, source: &Path, replace: bool) -> PathBuf {
+    let wanted = paths::final_file(dir, title, extension);
+    if replace || wanted.as_path() == source || !wanted.exists() {
         wanted
     } else {
-        paths::unique_path(dir, title, extension)
+        paths::unique_path_except(dir, title, extension, Some(source))
     }
 }
 
@@ -864,6 +908,17 @@ fn fail(shared: &Shared, id: u64, note: &str) {
     }
 }
 
+fn already_saved(shared: &Shared, id: u64) {
+    let mut live = shared.live.lock().expect("live");
+    if let Some(row) = live.rows.iter_mut().find(|row| row.id == id) {
+        row.kind = RowKind::Saved;
+        row.note = "Already saved".into();
+        row.fraction = 1.0;
+        row.convert = 1.0;
+        live.ok += 1;
+    }
+}
+
 fn remove_done(shared: &Shared, id: u64, size: u64) {
     let mut live = shared.live.lock().expect("live");
     if let Some(index) = live.rows.iter().position(|row| row.id == id) {
@@ -990,6 +1045,90 @@ mod tests {
         let result = run_command(&shared, Path::new("cmd.exe"), &args, None, false, |_| {});
         assert_eq!(result.err().as_deref(), Some("Stopped."));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ld-run-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_fallback_never_picks_a_similar_older_file() {
+        let dir = scratch("similar");
+        fs::write(dir.join("Song (Live).mp4"), vec![0u8; 5000]).unwrap();
+        fs::write(dir.join("Songbird.mp4"), vec![0u8; 6000]).unwrap();
+        let stem = paths::download_stem(&dir, "Song");
+        assert_eq!(stem, "Song");
+        let before = folder_names(&dir);
+        fs::write(dir.join("Song.f137.mp4"), vec![0u8; 9000]).unwrap();
+        fs::write(dir.join("Song.mkv"), vec![0u8; 100]).unwrap();
+        // main prints a bare path with no "after_move:" label, so `saved` is empty
+        assert_eq!(resolve_download(&dir, &stem, "", &before), Some(dir.join("Song.mkv")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_was_already_there_is_never_the_download() {
+        let dir = scratch("existing");
+        fs::write(dir.join("Song.mkv"), b"the user's own file").unwrap();
+        let before = folder_names(&dir);
+        assert_eq!(resolve_download(&dir, "Song", "", &before), None);
+        let printed = dir.join("Song.mkv").display().to_string();
+        assert_eq!(resolve_download(&dir, "Song", &printed, &before), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rerun_saves_under_the_plain_name_or_the_next_free_number() {
+        let dir = scratch("rerun");
+        fs::write(dir.join("Song.m4a"), b"first").unwrap();
+        let stem = paths::download_stem(&dir, "Song");
+        assert_eq!(stem, "Song (2)");
+        let source = dir.join("Song (2).m4a");
+        fs::write(&source, b"second").unwrap();
+        // used to be "Song (3).m4a"
+        assert_eq!(final_path(&dir, "Song", "m4a", &source, false), source);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_replaces_only_the_same_name_and_only_at_the_final_move() {
+        let dir = scratch("overwrite");
+        fs::write(dir.join("Song.mp4"), b"old").unwrap();
+        fs::write(dir.join("Song (Live).mp4"), b"live").unwrap();
+        let stem = paths::download_stem(&dir, "Song");
+        let source = dir.join(format!("{stem}.mkv"));
+        fs::write(&source, b"new download").unwrap();
+        // Picking the name changes nothing on disk.
+        let destination = final_path(&dir, "Song", "mp4", &source, true);
+        assert_eq!(destination, dir.join("Song.mp4"));
+        assert_eq!(fs::read(dir.join("Song.mp4")).unwrap(), b"old");
+        // Without the option, the old file keeps its name and the new one gets a number.
+        assert_eq!(final_path(&dir, "Song", "mp4", &source, false), dir.join("Song (2).mp4"));
+        // The final move replaces it in one step.
+        let ready = dir.join("part-1.mp4");
+        fs::write(&ready, b"new tagged").unwrap();
+        move_file(&ready, &destination).unwrap();
+        assert_eq!(fs::read(dir.join("Song.mp4")).unwrap(), b"new tagged");
+        assert_eq!(fs::read(dir.join("Song (Live).mp4")).unwrap(), b"live");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn already_saved_counts_as_done_and_keeps_its_row() {
+        let shared = Shared::new();
+        {
+            let mut live = shared.live.lock().unwrap();
+            live.total = 1;
+            live.rows.push(WorkRow { id: 7, name: "Song".into(), size: 0, copied: 0, fraction: 0.0, convert: 0.0, kind: RowKind::Queued, note: String::new() });
+        }
+        already_saved(&shared, 7);
+        let live = shared.live.lock().unwrap();
+        assert_eq!(live.ok, 1);
+        assert_eq!(live.rows[0].kind, RowKind::Saved);
+        assert_eq!(live.rows[0].note, "Already saved");
     }
 
     fn out(code: i32, stdout: &str, log: &str) -> RunOut {

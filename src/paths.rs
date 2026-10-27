@@ -237,31 +237,132 @@ fn stem_used(dir: &Path, stem: &str) -> bool {
     };
     entries.flatten().any(|entry| {
         let name = entry.file_name().to_string_lossy().to_string();
+        if name == PARTIAL_DIR {
+            return false;
+        }
         match name.strip_prefix(stem) {
-            Some(rest) => rest.is_empty() || rest.starts_with('.'),
+            Some(rest) => rest.is_empty() || (rest.starts_with('.') && !is_ytdlp_leftover(&rest[1..])),
             None => false,
         }
     })
 }
 
+/// True for the pieces yt-dlp leaves behind for a download that did not
+/// finish, given the part of the name after `stem.`:
+/// `mkv.part`, `f137.mp4`, `f137.mp4.part`, `temp.mkv`, `mkv.ytdl`,
+/// `f137.mp4.part-Frag3`. These must not push the next try to "Song (2)":
+/// keeping the same name lets yt-dlp carry on from the partial file.
+pub fn is_ytdlp_leftover(rest: &str) -> bool {
+    let lower = rest.to_ascii_lowercase();
+    if lower.ends_with(".part") || lower.ends_with(".ytdl") || lower.contains(".part-frag") {
+        return true;
+    }
+    if lower.starts_with("temp.") {
+        return true;
+    }
+    let first = lower.split('.').next().unwrap_or("");
+    lower.contains('.') && first.len() > 1 && first.starts_with('f') && first[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && first[1..].chars().any(|c| c.is_ascii_digit())
+}
+
+/// True when `name` is the finished file yt-dlp makes for `stem`:
+/// exactly `stem.ext`, one extension, and not a leftover or a side file.
+/// "Song (Live).mkv", "Song.f137.mp4" and "Song.mkv.part" are not a match for "Song".
+pub fn is_download_of(name: &str, stem: &str) -> bool {
+    let Some(rest) = name.strip_prefix(stem).and_then(|rest| rest.strip_prefix('.')) else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains('.') || is_ytdlp_leftover(rest) {
+        return false;
+    }
+    !matches!(
+        rest.to_ascii_lowercase().as_str(),
+        "part" | "ytdl" | "jpg" | "jpeg" | "png" | "webp" | "json" | "description" | "srt" | "vtt" | "lrc" | "txt" | "log"
+    )
+}
+
+#[cfg(test)]
 pub fn unique_path(dir: &Path, title: &str, extension: &str) -> PathBuf {
+    unique_path_except(dir, title, extension, None)
+}
+
+/// Like `unique_path`, but `mine` counts as free. That is the file being
+/// converted, which is about to be replaced, so "Song (2).m4a" can stay
+/// "Song (2)" instead of jumping to "Song (3)".
+pub fn unique_path_except(dir: &Path, title: &str, extension: &str, mine: Option<&Path>) -> PathBuf {
     let base = sanitize(title);
+    let free = |path: &PathBuf| mine == Some(path.as_path()) || !path.exists();
     let first = dir.join(format!("{base}.{extension}"));
-    if !first.exists() {
+    if free(&first) {
         return first;
     }
     for number in 2..10_000 {
         let candidate = dir.join(format!("{base} ({number}).{extension}"));
-        if !candidate.exists() {
+        if free(&candidate) {
             return candidate;
         }
     }
     dir.join(format!("{base} (copy).{extension}"))
 }
 
+/// Where the finished file for `title` goes when nothing is in the way.
+pub fn final_file(dir: &Path, title: &str, extension: &str) -> PathBuf {
+    dir.join(format!("{}.{}", sanitize(title), extension))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ld-paths-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn leftovers_from_a_stopped_download_keep_the_same_name() {
+        let dir = scratch("leftover");
+        for name in ["Song.f137.mp4.part", "Song.f140.m4a", "Song.mkv.ytdl", "Song.temp.mkv", "Song.mkv.part"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join(PARTIAL_DIR).join("1234")).unwrap();
+        assert_eq!(download_stem(&dir, "Song"), "Song");
+        assert_eq!(download_stem(&dir, ".link-download-partial"), ".link-download-partial");
+        std::fs::write(dir.join("Song.mkv"), b"x").unwrap();
+        assert_eq!(download_stem(&dir, "Song"), "Song (2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_exact_stem_counts_as_the_download() {
+        assert!(is_download_of("Song.mkv", "Song"));
+        assert!(is_download_of("Song.m4a", "Song"));
+        assert!(is_download_of("Song (2).mkv", "Song (2)"));
+        assert!(!is_download_of("Song (Live).mkv", "Song"));
+        assert!(!is_download_of("Song (2).mkv", "Song"));
+        assert!(!is_download_of("Songbird.mkv", "Song"));
+        assert!(!is_download_of("Song.f137.mp4", "Song"));
+        assert!(!is_download_of("Song.mkv.part", "Song"));
+        assert!(!is_download_of("Song.webp", "Song"));
+        assert!(!is_download_of("Song", "Song"));
+        assert!(is_ytdlp_leftover("f137.mp4"));
+        assert!(is_ytdlp_leftover("f251-drc.webm"));
+        assert!(!is_ytdlp_leftover("flac"));
+        assert!(!is_ytdlp_leftover("mkv"));
+    }
+
+    #[test]
+    fn the_file_being_converted_does_not_push_the_number_up() {
+        let dir = scratch("except");
+        std::fs::write(dir.join("Song.m4a"), b"old").unwrap();
+        std::fs::write(dir.join("Song (2).m4a"), b"new").unwrap();
+        let mine = dir.join("Song (2).m4a");
+        assert_eq!(unique_path_except(&dir, "Song", "m4a", Some(&mine)), mine);
+        assert_eq!(unique_path(&dir, "Song", "m4a"), dir.join("Song (3).m4a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use crate::model::{Group, Item};
 
     fn item(title: &str, artists: &[&str]) -> Item {
