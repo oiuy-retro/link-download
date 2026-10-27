@@ -215,6 +215,11 @@ fn fill_page_height(has_fill: bool, view_h: i32, built: i32) -> i32 {
     if has_fill { view_h } else { built }
 }
 
+/// Height of the page host: inner area below the caption, minus the title strip and the Back/Next bar.
+fn chrome_view_h(inner_bottom: i32, caption_bottom: i32, header: i32, bar: i32) -> i32 {
+    (inner_bottom - caption_bottom - header - bar).max(1)
+}
+
 /// True when this control sits in the reserved strip under a Fill sibling.
 fn fill_footer(kid: &BoxSpec, page: &[BoxSpec]) -> bool {
     page.iter().any(|fill| {
@@ -1926,8 +1931,8 @@ impl App {
     }
 
     fn view_h(&self) -> i32 {
-        let (_, h) = client_of(self.hwnd);
-        (h - self.s(46) - self.s(46)).max(1)
+        let chrome = self.chrome();
+        chrome_view_h(chrome.inner.bottom, chrome.caption.bottom, self.s(46), self.s(46))
     }
 
     fn host_width(&self) -> i32 {
@@ -4757,5 +4762,13 @@ mod layout_tests {
     fn a_fill_page_uses_the_view_height() {
         assert_eq!(fill_page_height(true, 500, 388), 500);
         assert_eq!(fill_page_height(false, 500, 388), 388);
+    }
+
+    #[test]
+    fn the_page_view_sits_between_the_header_and_the_button_bar() {
+        // 480 client, 3px border, 18px caption, 46px header, 46px Back/Next bar.
+        assert_eq!(super::chrome_view_h(477, 21, 46, 46), 364);
+        // Counting only the header and bar would leave the last rows under the bar.
+        assert!(super::chrome_view_h(477, 21, 46, 46) < 480 - 46 - 46);
     }
 }
