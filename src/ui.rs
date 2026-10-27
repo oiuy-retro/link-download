@@ -185,6 +185,83 @@ struct Kid {
     bottom: i32,
 }
 
+impl Kid {
+    fn spec(&self) -> BoxSpec {
+        BoxSpec {
+            x: self.x,
+            y: self.y,
+            w: self.w,
+            h: self.h,
+            anchor: self.anchor,
+            right: self.right,
+            bottom: self.bottom,
+        }
+    }
+}
+
+/// Stored box used to place a control after the window size changes.
+#[derive(Clone, Copy)]
+struct BoxSpec {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    anchor: Anchor,
+    right: i32,
+    bottom: i32,
+}
+
+fn fill_page_height(has_fill: bool, view_h: i32, built: i32) -> i32 {
+    if has_fill { view_h } else { built }
+}
+
+/// Height of the page host: inner area below the caption, minus the title strip and the Back/Next bar.
+fn chrome_view_h(inner_bottom: i32, caption_bottom: i32, header: i32, bar: i32) -> i32 {
+    (inner_bottom - caption_bottom - header - bar).max(1)
+}
+
+/// True when this control sits in the reserved strip under a Fill sibling.
+fn fill_footer(kid: &BoxSpec, page: &[BoxSpec]) -> bool {
+    page.iter().any(|fill| {
+        fill.anchor == Anchor::Fill
+            && kid.y >= fill.y + fill.h
+            && kid.y + kid.h <= fill.y + fill.h + fill.bottom + 2
+    })
+}
+
+fn place_box(kid: &BoxSpec, host_w: i32, view_h: i32, pin_bottom: bool) -> (i32, i32, i32, i32) {
+    let y = if pin_bottom {
+        (view_h - kid.bottom - kid.h).max(0)
+    } else {
+        kid.y
+    };
+    match kid.anchor {
+        Anchor::Fixed => (kid.x, y, kid.w, kid.h),
+        Anchor::StretchX => (kid.x, y, (host_w - kid.x - kid.right).max(40), kid.h),
+        Anchor::Right => (host_w - kid.right - kid.w, y, kid.w, kid.h),
+        Anchor::Fill => {
+            let w = (host_w - kid.x - kid.right).max(40);
+            let h = (view_h - kid.y - kid.bottom).max(40);
+            (kid.x, kid.y, w, h)
+        }
+    }
+}
+
+fn layout_page(kids: &[BoxSpec], host_w: i32, view_h: i32) -> Vec<(i32, i32, i32, i32)> {
+    kids.iter()
+        .map(|kid| {
+            let pin = kid.anchor != Anchor::Fill && fill_footer(kid, kids);
+            place_box(kid, host_w, view_h, pin)
+        })
+        .collect()
+}
+
+fn boxes_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
 struct App {
     hwnd: HWND,
     host: HWND,
@@ -867,6 +944,7 @@ impl App {
                     // Freeze, move, then paint once. Painting inside the size message is what tore the window.
                     unsafe { SendMessageW(self.hwnd, 0x000B, WPARAM(0), LPARAM(0)); }
                     self.layout_chrome();
+                    self.sync_fill_page_height();
                     self.update_scroll();
                     self.place();
                     self.place_sheet();
@@ -1216,7 +1294,11 @@ impl App {
             4 => self.build_meta(),
             _ => self.build_work(),
         };
-        self.content_height = bottom + self.s(8);
+        self.content_height = fill_page_height(
+            self.kids.iter().any(|kid| kid.anchor == Anchor::Fill),
+            self.view_h(),
+            bottom + self.s(8),
+        );
         self.update_scroll();
         self.place();
         self.place_sheet();
@@ -1296,9 +1378,12 @@ impl App {
         self.link_hwnd = self.edit(self.s(8), y, w - self.s(16), ID_LINKS, true, false);
         unsafe { let _ = MoveWindow(self.link_hwnd, self.s(8), y, w - self.s(16), edit_h, true); }
         let link_w = w - self.s(16);
+        let link_bottom = error_h + self.s(8);
         if let Some(kid) = self.kids.iter_mut().find(|kid| kid.hwnd == self.link_hwnd) {
             kid.h = edit_h;
             kid.w = link_w;
+            kid.anchor = Anchor::Fill;
+            kid.bottom = link_bottom;
         }
         set_text(self.link_hwnd, &self.links);
         y += edit_h + self.s(4);
@@ -1495,8 +1580,10 @@ impl App {
         y += self.s(22);
         let list_h = (self.view_h() - y - self.s(78)).max(self.s(120));
         self.list_hwnd = self.make(self.host, "LinkWorkList", "", 0x40000000 | 0x10000000 | 0x10000, 0x200, self.s(8), y, w - self.s(16), list_h, 52, 0);
+        self.set_fill(self.list_hwnd, self.s(78));
         y += list_h + self.s(8);
         self.progress_hwnd = self.make(self.host, "msctls_progress32", "", 0x40000000 | 0x10000000, 0, self.s(8), y, w - self.s(70), self.s(16), ID_PROGRESS, 0);
+        self.set_anchor(self.progress_hwnd, Anchor::StretchX);
         unsafe { SendMessageW(self.progress_hwnd, PBM_SETRANGE32, WPARAM(0), LPARAM(1000)); }
         self.percent_hwnd = self.static_text(w - self.s(58), y, self.s(50), self.s(16), "0%", false);
         set_id(self.percent_hwnd, ID_PERCENT);
@@ -1657,12 +1744,9 @@ impl App {
             let right = (host_w - (x + w)).max(0);
             let in_view = y >= 0 && y + h <= view_h + 2;
             let bottom = if in_view { view_h - (y + h) } else { 0 };
-            // Bottom used to catch every short control past the first screen, because its
-            // distance to the viewport bottom was clamped to zero. Those controls then all
-            // drew on top of each other. Only a control that is actually in the view can pin.
-            let anchor = if in_view && h >= 100 && bottom <= 120 {
-                Anchor::Fill
-            } else if right <= 20 && w >= 160 {
+            // Fill is set by the page that owns a stretching list or edit. Auto-Fill on any
+            // tall control near the bottom pinned Names lists and stacked later groups.
+            let anchor = if right <= 20 && w >= 160 {
                 Anchor::StretchX
             } else if right <= 16 && w <= 110 {
                 Anchor::Right
@@ -1677,6 +1761,20 @@ impl App {
     fn set_anchor(&mut self, hwnd: HWND, anchor: Anchor) {
         if let Some(kid) = self.kids.iter_mut().rev().find(|kid| kid.hwnd == hwnd) {
             kid.anchor = anchor;
+        }
+    }
+
+    fn set_fill(&mut self, hwnd: HWND, bottom: i32) {
+        if let Some(kid) = self.kids.iter_mut().rev().find(|kid| kid.hwnd == hwnd) {
+            kid.anchor = Anchor::Fill;
+            kid.bottom = bottom;
+        }
+    }
+
+    fn sync_fill_page_height(&mut self) {
+        if self.kids.iter().any(|kid| kid.anchor == Anchor::Fill) {
+            self.content_height = self.view_h();
+            self.scroll = 0;
         }
     }
 
@@ -1701,21 +1799,20 @@ impl App {
     fn place(&self) {
         let host_w = self.host_width().max(1);
         let view_h = self.view_h().max(1);
+        let specs: Vec<BoxSpec> = self.kids.iter().map(Kid::spec).collect();
+        let boxes = layout_page(&specs, host_w, view_h);
         // Positions are on the sheet. Scrolling moves the sheet, not each control.
-        for kid in &self.kids {
-            let (x, y, w, h) = match kid.anchor {
-                Anchor::Fixed => (kid.x, kid.y, kid.w, kid.h),
-                Anchor::StretchX => (kid.x, kid.y, (host_w - kid.x - kid.right).max(40), kid.h),
-                Anchor::Right => (host_w - kid.right - kid.w, kid.y, kid.w, kid.h),
-                Anchor::Fill => {
-                    let w = (host_w - kid.x - kid.right).max(40);
-                    let h = (view_h - kid.y - kid.bottom).max(40);
-                    (kid.x, kid.y, w, h)
-                }
-            };
+        for (kid, (x, y, w, h)) in self.kids.iter().zip(boxes) {
             unsafe { let _ = MoveWindow(kid.hwnd, x, y, w, h, false); }
-            if class_name(kid.hwnd) == "SysListView32" {
+            let class = class_name(kid.hwnd);
+            if class == "SysListView32" {
                 unsafe { SendMessageW(kid.hwnd, 0x101E, WPARAM(0), LPARAM((w - 8).max(40) as isize)); }
+            }
+            if class == "ComboBox" {
+                self.clip_closed_combo(kid.hwnd);
+            }
+            if class == "LinkWorkList" {
+                unsafe { let _ = InvalidateRect(kid.hwnd, None, false); }
             }
         }
     }
@@ -1834,8 +1931,8 @@ impl App {
     }
 
     fn view_h(&self) -> i32 {
-        let (_, h) = client_of(self.hwnd);
-        (h - self.s(46) - self.s(46)).max(1)
+        let chrome = self.chrome();
+        chrome_view_h(chrome.inner.bottom, chrome.caption.bottom, self.s(46), self.s(46))
     }
 
     fn host_width(&self) -> i32 {
@@ -4579,5 +4676,99 @@ mod typing_popup_tests {
     fn drop_downs_and_check_boxes_still_explain_at_once() {
         assert!(popup_for(ID_RES, CBN_SELCHANGE as u16, true));
         assert!(popup_for(ID_AUDIO, 0, true));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{boxes_overlap, fill_page_height, layout_page, Anchor, BoxSpec};
+
+    fn spec(x: i32, y: i32, w: i32, h: i32, anchor: Anchor, right: i32, bottom: i32) -> BoxSpec {
+        BoxSpec { x, y, w, h, anchor, right, bottom }
+    }
+
+    fn download_page() -> Vec<BoxSpec> {
+        // 640x480 client minus 46px header and footer: view 388, list above a 78px readout strip.
+        vec![
+            spec(8, 8, 624, 18, Anchor::StretchX, 8, 362),
+            spec(8, 30, 624, 280, Anchor::Fill, 8, 78),
+            spec(8, 318, 570, 16, Anchor::StretchX, 62, 54),
+            spec(582, 318, 50, 16, Anchor::Right, 8, 54),
+            spec(8, 340, 72, 16, Anchor::Fixed, 560, 32),
+            spec(80, 340, 88, 16, Anchor::Fixed, 472, 32),
+            spec(8, 358, 72, 16, Anchor::Fixed, 560, 14),
+            spec(80, 358, 88, 16, Anchor::Fixed, 472, 14),
+        ]
+    }
+
+    #[test]
+    fn growing_the_window_keeps_the_list_above_the_readouts() {
+        let page = download_page();
+        let placed = layout_page(&page, 640, 500);
+        let list = placed[1];
+        assert_eq!(list, (8, 30, 624, 392));
+        for footer in &placed[2..] {
+            assert!(!boxes_overlap(list, *footer), "list {:?} covers {:?}", list, footer);
+            assert!(footer.1 + footer.3 <= 500);
+        }
+        assert_eq!(placed[2].1, 430);
+        assert_eq!(placed[4].1, 452);
+        assert_eq!(placed[6].1, 470);
+    }
+
+    #[test]
+    fn shrinking_the_window_keeps_the_readouts_on_the_page() {
+        let page = download_page();
+        let placed = layout_page(&page, 640, 300);
+        let list = placed[1];
+        assert_eq!(list.3, 192);
+        for footer in &placed[2..] {
+            assert!(!boxes_overlap(list, *footer));
+            assert!(footer.1 >= 0);
+            assert!(footer.1 + footer.3 <= 300);
+        }
+        assert_eq!(placed[2].1, 230);
+        assert_eq!(placed[6].1, 270);
+    }
+
+    #[test]
+    fn options_controls_stay_put_when_there_is_no_fill() {
+        let page = vec![
+            spec(124, 10, 200, 21, Anchor::Fixed, 316, 357),
+            spec(124, 330, 400, 21, Anchor::StretchX, 116, 37),
+            spec(540, 330, 75, 23, Anchor::Right, 25, 35),
+        ];
+        let grown = layout_page(&page, 800, 500);
+        assert_eq!(grown[0], (124, 10, 200, 21));
+        assert_eq!(grown[1], (124, 330, 560, 21));
+        assert_eq!(grown[2], (700, 330, 75, 23));
+    }
+
+    #[test]
+    fn the_links_error_stays_under_the_edit() {
+        let page = vec![
+            spec(8, 10, 624, 32, Anchor::Fixed, 8, 346),
+            spec(8, 46, 624, 302, Anchor::Fill, 8, 40),
+            spec(8, 352, 624, 32, Anchor::Fixed, 8, 4),
+        ];
+        let placed = layout_page(&page, 800, 500);
+        assert_eq!(placed[1], (8, 46, 784, 414));
+        assert_eq!(placed[2], (8, 464, 624, 32));
+        assert!(!boxes_overlap(placed[1], placed[2]));
+        assert_eq!(placed[1].1 + placed[1].3 + 4, placed[2].1);
+    }
+
+    #[test]
+    fn a_fill_page_uses_the_view_height() {
+        assert_eq!(fill_page_height(true, 500, 388), 500);
+        assert_eq!(fill_page_height(false, 500, 388), 388);
+    }
+
+    #[test]
+    fn the_page_view_sits_between_the_header_and_the_button_bar() {
+        // 480 client, 3px border, 18px caption, 46px header, 46px Back/Next bar.
+        assert_eq!(super::chrome_view_h(477, 21, 46, 46), 364);
+        // Counting only the header and bar would leave the last rows under the bar.
+        assert!(super::chrome_view_h(477, 21, 46, 46) < 480 - 46 - 46);
     }
 }
