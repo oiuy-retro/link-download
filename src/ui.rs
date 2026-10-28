@@ -1410,6 +1410,9 @@ impl App {
             let url = self.groups[group_index].source_url.clone();
             let error = self.groups[group_index].error.clone();
             let titles: Vec<String> = self.groups[group_index].items.iter().map(|item| item.title.clone()).collect();
+            if group_index > 0 {
+                y = self.group_divider(y, w);
+            }
             y = self.url_line(y, w, &url);
             if !error.is_empty() {
                 self.static_text(self.s(8), y, w - self.s(16), self.s(32), &error, true);
@@ -1421,6 +1424,10 @@ impl App {
             let list_h = self.s(20) + rows * self.s(18) + self.s(4);
             let list = self.listview(self.s(8), y, w - self.s(16), list_h, ID_LIST + group_index as i32);
             fill_titles(list, &titles, w - self.s(24));
+            // The guess above uses fixed pixel sizes. The real header and rows can be taller,
+            // which hid the last name under a scroll bar. Grow the list to what it needs.
+            let list_h = list_h.max(list_fit_height(list, rows));
+            self.resize_kid(list, w - self.s(16), list_h);
             y += list_h + self.s(4);
             // SS_OWNERDRAW, so the characters that make the name illegal can be drawn in bold.
             let error = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x000D, 0, self.s(8), y, w - self.s(16), self.s(32), 0, 0);
@@ -1622,6 +1629,16 @@ impl App {
         bar_y + self.s(24)
     }
 
+    /// An etched line between two links, so each link reads as the heading of the
+    /// box, list, and warning under it, not as a line under the link before.
+    fn group_divider(&mut self, y: i32, w: i32) -> i32 {
+        let y = y + self.s(4);
+        // SS_ETCHEDHORZ
+        let line = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x10, 0, self.s(8), y, w - self.s(16), 2, 0, 0);
+        self.set_anchor(line, Anchor::StretchX);
+        y + self.s(10)
+    }
+
     fn url_line(&mut self, y: i32, w: i32, url: &str) -> i32 {
         self.static_text(self.s(8), y, w - self.s(16), self.s(32), url, true);
         y + self.s(34)
@@ -1767,6 +1784,21 @@ impl App {
         }
     }
 
+    /// Changes a page control's size after it was made, keeping its layout record in step.
+    fn resize_kid(&mut self, hwnd: HWND, w: i32, h: i32) {
+        let view_h = self.view_h().max(1);
+        if let Some(kid) = self.kids.iter_mut().rev().find(|kid| kid.hwnd == hwnd) {
+            if kid.h == h && kid.w == w {
+                return;
+            }
+            kid.w = w;
+            kid.h = h;
+            let in_view = kid.y >= 0 && kid.y + h <= view_h + 2;
+            kid.bottom = if in_view { view_h - (kid.y + h) } else { 0 };
+            unsafe { let _ = MoveWindow(hwnd, kid.x, kid.y, w, h, false); }
+        }
+    }
+
     fn set_fill(&mut self, hwnd: HWND, bottom: i32) {
         if let Some(kid) = self.kids.iter_mut().rev().find(|kid| kid.hwnd == hwnd) {
             kid.anchor = Anchor::Fill;
@@ -1809,7 +1841,12 @@ impl App {
             unsafe { let _ = MoveWindow(kid.hwnd, x, y, w, h, false); }
             let class = class_name(kid.hwnd);
             if class == "SysListView32" {
-                unsafe { SendMessageW(kid.hwnd, 0x101E, WPARAM(0), LPARAM((w - 8).max(40) as isize)); }
+                // LVM_SETCOLUMNWIDTH. Fit the column to the inside of the list, so a guessed
+                // width can never be wider than the list and add a sideways scroll bar.
+                let mut inner = RECT::default();
+                unsafe { let _ = GetClientRect(kid.hwnd, &mut inner); }
+                let room = if inner.right > 0 { inner.right - 2 } else { w - 8 };
+                unsafe { SendMessageW(kid.hwnd, 0x101E, WPARAM(0), LPARAM(room.max(40) as isize)); }
             }
             if class == "ComboBox" {
                 self.clip_closed_combo(kid.hwnd);
@@ -3324,6 +3361,37 @@ fn text_in(hdc: HDC, text: &str, mut rect: RECT, format: windows::Win32::Graphic
     }
 }
 
+/// Window height a report list needs to show its header and `rows` whole rows with no
+/// scroll bar, measured from the list itself so any font or scaling is covered.
+fn list_fit_height(list: HWND, rows: i32) -> i32 {
+    unsafe {
+        let mut outer = RECT::default();
+        let mut inner = RECT::default();
+        let _ = GetWindowRect(list, &mut outer);
+        let _ = GetClientRect(list, &mut inner);
+        let frame = (outer.bottom - outer.top) - (inner.bottom - inner.top);
+        // LVM_GETHEADER
+        let header = HWND(SendMessageW(list, 0x101F, WPARAM(0), LPARAM(0)).0 as *mut _);
+        let mut head = RECT::default();
+        if !header.0.is_null() {
+            let _ = GetWindowRect(header, &mut head);
+        }
+        // LVM_GETITEMRECT with LVIR_BOUNDS for the first row.
+        let mut row = RECT { left: 0, ..Default::default() };
+        let got = SendMessageW(list, 0x100E, WPARAM(0), LPARAM(&mut row as *mut _ as isize)).0 != 0;
+        let row_h = if got { row.bottom - row.top } else { 0 };
+        if row_h <= 0 {
+            return 0;
+        }
+        list_height(frame, head.bottom - head.top, row_h, rows)
+    }
+}
+
+/// Frame, header, and whole rows, plus 2 pixels so the last row never touches the edge.
+fn list_height(frame: i32, header: i32, row: i32, rows: i32) -> i32 {
+    frame.max(0) + header.max(0) + row * rows.max(1) + 2
+}
+
 fn fill_titles(list: HWND, titles: &[String], width: i32) {
     let mut title = wide("File name");
     let column = LVCOLUMNW {
@@ -3520,14 +3588,15 @@ unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFO
     for (ch, mark) in marks {
         SelectObject(hdc, if *mark == Mark::Plain { normal } else { bold });
         let mut buf = [0u16; 2];
-        widths.push(text_width(hdc, ch.encode_utf16(&mut buf)));
+        let extra = if *mark == Mark::Plain { 0 } else { MARK_SMEAR };
+        widths.push(text_width(hdc, ch.encode_utf16(&mut buf)) + extra);
     }
     SelectObject(hdc, normal);
     let dots: Vec<u16> = "...".encode_utf16().collect();
     let keep = fit_count(&widths, rect.right - rect.left, text_width(hdc, &dots));
     let up = normal_up.max(bold_up);
     let down = (normal_h - normal_up).max(bold_h - bold_up);
-    let baseline = marked_baseline(rect.top, rect.bottom, normal_h, normal_up, bold_h, bold_up);
+    let baseline = marked_baseline(rect.top, rect.bottom, normal_h, normal_up, bold_h + MARK_SMEAR, bold_up + MARK_SMEAR);
     let align = SetTextAlign(hdc, TEXT_ALIGN_OPTIONS(24));
     let mut x = rect.left;
     let mut start = 0;
@@ -3537,20 +3606,37 @@ unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFO
         while end < keep && marks[end].1 == mark {
             end += 1;
         }
-        let run: String = marks[start..end].iter().map(|(ch, _)| *ch).collect();
-        let wide: Vec<u16> = run.encode_utf16().collect();
         SelectObject(hdc, if mark == Mark::Plain { normal } else { bold });
-        let width = text_width(hdc, &wide);
+        if mark == Mark::Plain {
+            let run: String = marks[start..end].iter().map(|(ch, _)| *ch).collect();
+            let wide: Vec<u16> = run.encode_utf16().collect();
+            let _ = TextOutW(hdc, x, baseline, &wide);
+            x += text_width(hdc, &wide);
+            start = end;
+            continue;
+        }
+        // Marked characters one at a time, each drawn again 1 pixel right and 1 pixel up.
+        // A bold bitmap font draws some of them, such as ':' and '.', with the same thin
+        // dots as the plain font, so the bold font alone does not make them stand out.
+        let width: i32 = widths[start..end].iter().sum();
         if mark == Mark::End {
-            let block = RECT { left: x, top: baseline - up, right: x + width, bottom: baseline + down };
+            let block = RECT { left: x, top: baseline - up - MARK_SMEAR, right: x + width, bottom: baseline + down };
             let brush = CreateSolidBrush(fore);
             let _ = FillRect(hdc, &block, brush);
             let _ = DeleteObject(brush);
             let _ = SetTextColor(hdc, back);
-            let _ = TextOutW(hdc, x, baseline, &wide);
+        }
+        let mut cx = x;
+        for (index, (ch, _)) in marks[start..end].iter().enumerate() {
+            let mut buf = [0u16; 2];
+            let one = ch.encode_utf16(&mut buf);
+            for (dx, dy) in smear_offsets() {
+                let _ = TextOutW(hdc, cx + dx, baseline - dy, one);
+            }
+            cx += widths[start + index];
+        }
+        if mark == Mark::End {
             let _ = SetTextColor(hdc, fore);
-        } else {
-            let _ = TextOutW(hdc, x, baseline, &wide);
         }
         x += width;
         start = end;
@@ -3561,6 +3647,15 @@ unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFO
     }
     SetTextAlign(hdc, TEXT_ALIGN_OPTIONS(align));
     SelectObject(hdc, normal);
+}
+
+/// Extra pixels each marked character is thickened by, sideways and up.
+const MARK_SMEAR: i32 = 1;
+
+/// Where each marked character is drawn, relative to its own spot: once in place and
+/// again shifted right, up, and both, so even a dot like ':' becomes a solid block.
+fn smear_offsets() -> [(i32, i32); 4] {
+    [(0, 0), (MARK_SMEAR, 0), (0, MARK_SMEAR), (MARK_SMEAR, MARK_SMEAR)]
 }
 
 /// The plain text sits where the list would put it, centered in the row. The bigger
@@ -4970,5 +5065,40 @@ mod layout_tests {
         assert_eq!(super::chrome_view_h(477, 21, 46, 46), 364);
         // Counting only the header and bar would leave the last rows under the bar.
         assert!(super::chrome_view_h(477, 21, 46, 46) < 480 - 46 - 46);
+    }
+}
+
+#[cfg(test)]
+mod names_page_tests {
+    use super::{fit_count, list_height, smear_offsets, MARK_SMEAR};
+
+    #[test]
+    fn marked_characters_are_thickened_both_ways() {
+        // Drawn in place, right, up, and both, so a ':' made of 1 pixel dots turns into 2 by 2 blocks.
+        let offsets = smear_offsets();
+        assert!(offsets.contains(&(0, 0)));
+        assert!(offsets.contains(&(MARK_SMEAR, 0)));
+        assert!(offsets.contains(&(0, MARK_SMEAR)));
+        assert!(offsets.contains(&(MARK_SMEAR, MARK_SMEAR)));
+        assert!(MARK_SMEAR >= 1);
+    }
+
+    #[test]
+    fn the_list_is_tall_enough_for_every_row() {
+        // 100%: 6 pixel frame, 20 pixel header, 17 pixel rows.
+        assert_eq!(list_height(6, 20, 17, 3), 6 + 20 + 51 + 2);
+        // 125%: taller header and rows still fit every name, the last one included.
+        let h = list_height(6, 25, 21, 8);
+        assert!(h - 6 - 25 >= 8 * 21);
+        // At least one row's room even for an empty list.
+        assert_eq!(list_height(6, 20, 17, 0), 6 + 20 + 17 + 2);
+    }
+
+    #[test]
+    fn widened_marks_still_count_toward_the_fit() {
+        // A mark is 1 pixel wider than its glyph; the fit must use the wider width.
+        let widths = [5, 5, 4 + MARK_SMEAR, 5];
+        assert_eq!(fit_count(&widths, 20, 6), 4);
+        assert_eq!(fit_count(&widths, 19, 6), 2);
     }
 }
