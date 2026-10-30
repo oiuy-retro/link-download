@@ -457,6 +457,16 @@ fn register_classes(instance: HINSTANCE, face: HBRUSH) {
         let _ = RegisterClassW(&main);
         let _ = RegisterClassW(&host);
         let _ = RegisterClassW(&list);
+        let bar = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(bar_proc),
+            hInstance: instance,
+            hCursor: cursor,
+            hbrBackground: face,
+            lpszClassName: w!("LinkProgressBar"),
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&bar);
         let _ = small;
     }
 }
@@ -664,6 +674,38 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             LRESULT(0)
         }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The overall progress bar. The stock progress control fills with the system highlight
+/// color, which is light blue on Windows 10 and 11 (and a visual style can repaint it
+/// any color), so it never matched the navy blocks of the per-item bars. This one draws
+/// the same blocks with `chunks`. It takes PBM_SETPOS with a position out of 1000.
+unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let _ = FillRect(hdc, &rect, FACE.get());
+            let pos = GetWindowLongPtrW(hwnd, GWLP_USERDATA).clamp(0, 1000);
+            chunks(hdc, rect, pos as f64 / 1000.0);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        PBM_SETPOS => {
+            let pos = (wparam.0 as isize).clamp(0, 1000);
+            let old = SetWindowLongPtrW(hwnd, GWLP_USERDATA, pos);
+            if old != pos {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(old)
+        }
+        // The range is always 0 to 1000.
+        PBM_SETRANGE32 => LRESULT(0),
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -1584,7 +1626,7 @@ impl App {
         self.list_hwnd = self.make(self.host, "LinkWorkList", "", 0x40000000 | 0x10000000 | 0x10000, 0x200, self.s(8), y, w - self.s(16), list_h, 52, 0);
         self.set_fill(self.list_hwnd, self.s(78));
         y += list_h + self.s(8);
-        self.progress_hwnd = self.make(self.host, "msctls_progress32", "", 0x40000000 | 0x10000000, 0, self.s(8), y, w - self.s(70), self.s(16), ID_PROGRESS, 0);
+        self.progress_hwnd = self.make(self.host, "LinkProgressBar", "", 0x40000000 | 0x10000000, 0, self.s(8), y, w - self.s(70), self.s(16), ID_PROGRESS, 0);
         self.set_anchor(self.progress_hwnd, Anchor::StretchX);
         unsafe { SendMessageW(self.progress_hwnd, PBM_SETRANGE32, WPARAM(0), LPARAM(1000)); }
         self.percent_hwnd = self.static_text(w - self.s(58), y, self.s(50), self.s(16), "0%", false);
@@ -1617,7 +1659,7 @@ impl App {
         let y = self.s(12);
         self.status_hwnd = self.static_text(self.s(8), y, w - self.s(16), self.s(18), text, false);
         let bar_y = y + self.s(24);
-        self.progress_hwnd = self.make(self.host, "msctls_progress32", "", 0x40000000 | 0x10000000, 0, self.s(8), bar_y, w - self.s(16), self.s(16), ID_PROGRESS, 0);
+        self.progress_hwnd = self.make(self.host, "LinkProgressBar", "", 0x40000000 | 0x10000000, 0, self.s(8), bar_y, w - self.s(16), self.s(16), ID_PROGRESS, 0);
         unsafe { SendMessageW(self.progress_hwnd, PBM_SETRANGE32, WPARAM(0), LPARAM(1000)); }
         bar_y + self.s(24)
     }
