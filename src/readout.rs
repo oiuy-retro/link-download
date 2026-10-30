@@ -51,6 +51,8 @@ pub fn format_items(per_second: f64) -> String {
     }
 }
 
+/// Time left with a unit on every field: 12D:05H:05M:04S. Leading units that are
+/// zero are left out (01H:05M:04S, 05M:04S), but minutes and seconds always show.
 pub fn format_eta(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "Calculating...".into();
@@ -61,11 +63,11 @@ pub fn format_eta(seconds: f64) -> String {
     let minutes = (total % 3_600) / 60;
     let secs = total % 60;
     if days > 0 {
-        format!("{days:02}:{hours:02}:{minutes:02}:{secs:02}")
+        format!("{days:02}D:{hours:02}H:{minutes:02}M:{secs:02}S")
     } else if hours > 0 {
-        format!("{hours:02}:{minutes:02}:{secs:02}")
+        format!("{hours:02}H:{minutes:02}M:{secs:02}S")
     } else {
-        format!("{minutes:02}:{secs:02}")
+        format!("{minutes:02}M:{secs:02}S")
     }
 }
 
@@ -127,14 +129,26 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.50 KB");
         assert_eq!(format_rate(2048.0), "2.00 KB/s");
         assert_eq!(format_items(1.2), "1.20");
-        assert_eq!(format_eta(2.0), "00:02");
-        assert_eq!(format_eta(90.0), "01:30");
-        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0), "05:10:00");
-        assert_eq!(format_eta(86_400.0 + 5.0 * 3600.0 + 10.0 * 60.0), "01:05:10:00");
         assert_eq!(format_elapsed(75), "1:15");
         assert_eq!(format_elapsed(3661), "1:01:01");
         assert_eq!(percent(0.999), 99);
         assert_eq!(percent(1.0), 100);
+    }
+
+    #[test]
+    fn time_left_shows_units() {
+        assert_eq!(format_eta(0.0), "00M:00S");
+        assert_eq!(format_eta(2.0), "00M:02S");
+        assert_eq!(format_eta(90.0), "01M:30S");
+        assert_eq!(format_eta(59.6), "01M:00S");
+        assert_eq!(format_eta(3599.0), "59M:59S");
+        assert_eq!(format_eta(3600.0), "01H:00M:00S");
+        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0), "05H:10M:00S");
+        assert_eq!(format_eta(86_400.0), "01D:00H:00M:00S");
+        assert_eq!(format_eta(12.0 * 86_400.0 + 5.0 * 3600.0 + 5.0 * 60.0 + 4.0), "12D:05H:05M:04S");
+        assert_eq!(format_eta(120.0 * 86_400.0), "120D:00H:00M:00S");
+        assert_eq!(format_eta(-1.0), "Calculating...");
+        assert_eq!(format_eta(f64::NAN), "Calculating...");
     }
 
     #[test]
