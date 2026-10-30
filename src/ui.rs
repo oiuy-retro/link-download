@@ -52,8 +52,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadImageW,
     MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, BM_GETCHECK, BM_SETCHECK,
-    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, DI_NORMAL, EN_CHANGE, EN_KILLFOCUS, GW_CHILD, GW_HWNDNEXT, GWL_STYLE,
+    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CS_DBLCLKS,
+    CW_USEDEFAULT, DI_NORMAL, EN_CHANGE, EN_KILLFOCUS, GW_CHILD, GW_HWNDNEXT, GWL_STYLE,
     GWLP_ID, GWLP_USERDATA, HMENU, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
     HTTOPLEFT, HTTOPRIGHT, HWND_TOP, IDC_ARROW, IMAGE_ICON, MINMAXINFO, MSG,
     NCCALCSIZE_PARAMS, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXFRAME, SM_CXPADDEDBORDER,
@@ -429,7 +429,9 @@ fn register_classes(instance: HINSTANCE, face: HBRUSH) {
         let small = load_icon(instance, 16);
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
         let main = WNDCLASSW {
-            style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW,
+            // No CS_HREDRAW | CS_VREDRAW. They repaint the whole window, every control included,
+            // on each step of a resize. WM_SIZE invalidates only what moved.
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance,
             hIcon: icon,
@@ -944,13 +946,15 @@ impl App {
             WM_SIZE => {
                 if wparam.0 != 1 {
                     // Freeze, move, then paint once. Painting inside the size message is what tore the window.
-                    unsafe { SendMessageW(self.hwnd, 0x000B, WPARAM(0), LPARAM(0)); }
+                    // Only the page area is frozen. WM_SETREDRAW on the top-level window hides it from
+                    // Windows for a moment, so the desktop behind showed through on every resize step.
+                    unsafe { SendMessageW(self.host, 0x000B, WPARAM(0), LPARAM(0)); }
                     self.layout_chrome();
                     self.sync_fill_page_height();
                     self.update_scroll();
                     self.place();
                     self.place_sheet();
-                    unsafe { SendMessageW(self.hwnd, 0x000B, WPARAM(1), LPARAM(0)); }
+                    unsafe { SendMessageW(self.host, 0x000B, WPARAM(1), LPARAM(0)); }
                     self.redraw();
                 }
                 Action::None
@@ -1072,8 +1076,18 @@ impl App {
     fn paint_chrome(&self) {
         unsafe {
             let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
-            let hdc = BeginPaint(self.hwnd, &mut ps);
+            let screen = BeginPaint(self.hwnd, &mut ps);
             let (w, h) = client_of(self.hwnd);
+            if w <= 0 || h <= 0 {
+                let _ = EndPaint(self.hwnd, &ps);
+                return;
+            }
+            // Draw the frame, caption, header and button bar off screen, then copy it in one go.
+            // Drawing straight to the screen showed each fill before the text and edges on top.
+            let hdc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, w, h);
+            let old_bitmap = SelectObject(hdc, bitmap);
+            let _ = FillRect(hdc, &RECT { left: 0, top: 0, right: w, bottom: h }, FACE.get());
             let chrome = self.chrome();
             let header = self.s(46);
             let bar = self.s(46);
@@ -1148,6 +1162,11 @@ impl App {
             if !self.maximized() {
                 classic::gripper(hdc, RECT { left: 0, top: 0, right: w, bottom: h });
             }
+            // The window clips its child controls, so this copy never draws over them.
+            let _ = BitBlt(screen, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
+            SelectObject(hdc, old_bitmap);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(hdc);
             let _ = EndPaint(self.hwnd, &ps);
         }
     }
@@ -1837,7 +1856,8 @@ impl App {
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 PCWSTR(class_w.as_ptr()),
                 PCWSTR(wide("").as_ptr()),
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0x40000000 | 0x10000000),
+                // WS_CLIPCHILDREN, so erasing the sheet does not paint over every control on it.
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0x40000000 | 0x10000000 | 0x02000000),
                 0,
                 0,
                 10,
