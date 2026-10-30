@@ -103,6 +103,7 @@ const ID_STATUS: i32 = 50;
 const ID_PROGRESS: i32 = 51;
 const ID_PERCENT: i32 = 53;
 const ID_READOUT: i32 = 60;
+const ID_START_OVER: i32 = 70;
 const ID_REMOVE: i32 = 1000;
 const ID_INSERT: i32 = 2000;
 const ID_MODE: i32 = 3000;
@@ -293,6 +294,9 @@ struct App {
     media_stamp: Options,
     have_media: bool,
     download_done: bool,
+    /// The last download run ended with every item failed. The Download page then
+    /// offers Start over.
+    all_failed: bool,
     ytdlp: PathBuf,
     ffmpeg: PathBuf,
     node: PathBuf,
@@ -880,6 +884,7 @@ impl App {
             media_stamp: Options::default(),
             have_media: false,
             download_done: false,
+            all_failed: false,
             ytdlp: PathBuf::new(),
             ffmpeg: PathBuf::new(),
             node: PathBuf::new(),
@@ -1609,6 +1614,12 @@ impl App {
             self.readout[index] = self.static_text(lx + label_w, ly, value_w, self.s(16), "—", false);
             set_id(self.readout[index], ID_READOUT + index as i32);
         }
+        if self.all_failed && self.busy == Busy::Idle {
+            // In the empty third column of the second row of readouts.
+            let bw = self.s(75);
+            let button = self.button(w - self.s(8) - bw, y + self.s(18), bw, "&Start over", ID_START_OVER, false);
+            self.set_anchor(button, Anchor::Right);
+        }
         y + self.s(40)
     }
 
@@ -2058,6 +2069,10 @@ impl App {
         if id == ID_BROWSE && code == 0 {
             return Action::Browse;
         }
+        if id == ID_START_OVER && code == 0 {
+            self.start_over();
+            return Action::None;
+        }
         if id == ID_PROFILE && code == CBN_SELCHANGE as u16 {
             self.change_profile();
             return Action::None;
@@ -2211,6 +2226,27 @@ impl App {
         Action::None
     }
 
+    /// Start over, after a run where every download failed: back to the first page as
+    /// if the program had just opened. The options and the pasted links are kept, so
+    /// the user can change what made the downloads fail and press Next again. The
+    /// links are looked up again, because nothing from the failed run is reused.
+    fn start_over(&mut self) {
+        if self.busy != Busy::Idle {
+            return;
+        }
+        self.all_failed = false;
+        self.download_done = false;
+        self.fetch_ok = false;
+        self.fetched_text.clear();
+        self.have_media = false;
+        self.groups.clear();
+        self.rows.clear();
+        self.started = None;
+        self.reset_speed();
+        self.page = 0;
+        self.rebuild();
+    }
+
     fn go_back(&mut self) -> Action {
         if self.page == 0 {
             return Action::None;
@@ -2221,6 +2257,7 @@ impl App {
         }
         if self.page == 5 {
             self.download_done = false;
+            self.all_failed = false;
         }
         self.page -= 1;
         self.rebuild();
@@ -2866,6 +2903,13 @@ impl App {
                 self.download_done = true;
                 self.have_media = true;
                 self.media_stamp = self.options.clone();
+                self.all_failed = all_failed(live.ok, live.bad);
+                if self.all_failed {
+                    // Puts the Start over button on the page, then fills the
+                    // status line, bar, and readouts back in.
+                    self.rebuild();
+                    self.paint_readouts(&live);
+                }
                 self.refresh_nav();
                 unsafe { let _ = InvalidateRect(self.list_hwnd, None, false); }
             }
@@ -4431,6 +4475,11 @@ fn group_of(id: i32) -> usize {
     (id - base) as usize
 }
 
+/// Every item in the run failed (or was unavailable), so nothing was saved.
+fn all_failed(ok: u32, bad: u32) -> bool {
+    ok == 0 && bad > 0
+}
+
 fn button_bits(default: bool) -> u32 {
     // Child, visible, tab stop, clip siblings. The last bit is the default-button style.
     0x40000000 | 0x10000000 | 0x10000 | 0x04000000 | if default { 1 } else { 0 }
@@ -4594,6 +4643,13 @@ fn font_bits(font: HFONT) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_over_only_when_every_item_failed() {
+        assert!(super::all_failed(0, 3));
+        assert!(!super::all_failed(1, 2));
+        assert!(!super::all_failed(0, 0));
+    }
+
     use super::*;
 
     #[test]
