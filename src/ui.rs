@@ -304,9 +304,15 @@ struct App {
     rows: Vec<WorkRow>,
     list_hwnd: HWND,
     list_scroll: i32,
-    /// Download speed averaged over the last five seconds. Speed and Time left both use it.
-    rate: readout::RollingRate,
+    /// Download speed, smoothed over about five seconds. Speed and Time left both use it.
+    rate: readout::SmoothRate,
     eta: readout::Countdown,
+    /// The active item that is converting, and when its convert started.
+    converting: Option<(u64, f64)>,
+    convert_total: f64,
+    convert_count: u32,
+    download_bytes: u64,
+    download_count: u32,
     sample_start: Instant,
     last_done: u32,
     base_done: Option<u32>,
@@ -891,8 +897,13 @@ impl App {
             rows: Vec::new(),
             list_hwnd: null,
             list_scroll: 0,
-            rate: readout::RollingRate::new(5.0),
+            rate: readout::SmoothRate::new(5.0),
             eta: readout::Countdown::new(),
+            converting: None,
+            convert_total: 0.0,
+            convert_count: 0,
+            download_bytes: 0,
+            download_count: 0,
             sample_start: Instant::now(),
             last_done: 0,
             base_done: None,
@@ -2795,6 +2806,11 @@ impl App {
     fn reset_speed(&mut self) {
         self.rate.clear();
         self.eta = readout::Countdown::new();
+        self.converting = None;
+        self.convert_total = 0.0;
+        self.convert_count = 0;
+        self.download_bytes = 0;
+        self.download_count = 0;
         self.sample_start = Instant::now();
         self.last_done = 0;
         self.base_done = None;
@@ -2881,31 +2897,69 @@ impl App {
         let now = Instant::now();
         let bytes = live.banked_bytes.saturating_add(live.current_bytes);
         let at = now.saturating_duration_since(self.sample_start).as_secs_f64();
-        self.rate.push(at, bytes);
+        // The app's own pause between items (see run::countdown). Nothing downloads in
+        // it, so it is left out of the speed.
+        let waiting = live.rows.iter().find(|row| row.kind == RowKind::Waiting).and_then(|row| readout::waiting_seconds(&row.note));
+        self.rate.push(at, bytes, waiting.is_some());
         // Items pinned before the run starts count as done but took no time. Leave them out.
         if live.total == 0 {
             return;
         }
         let done = live.ok.saturating_add(live.bad);
         let base = *self.base_done.get_or_insert(done);
+        let active = live.rows.iter().find(|row| row.kind == RowKind::Active);
         if done > self.last_done.max(base) {
             self.finished = done - base;
-            self.last_finish = now.saturating_duration_since(self.sample_start).as_secs_f64();
+            self.last_finish = at;
+            // The item that was converting is done: count how long its convert took.
+            if let Some((id, start)) = self.converting.take() {
+                if active.map(|row| row.id) != Some(id) {
+                    self.convert_total += at - start;
+                    self.convert_count += 1;
+                } else {
+                    self.converting = Some((id, start));
+                }
+            }
         }
         self.last_done = done;
+        if let Some(row) = active {
+            if row.convert > 0.0 && self.converting.map(|(id, _)| id) != Some(row.id) {
+                // Its download just finished. Remember its size for the items after it.
+                self.converting = Some((row.id, at));
+                if row.size > 0 {
+                    self.download_bytes = self.download_bytes.saturating_add(row.size);
+                    self.download_count += 1;
+                }
+            }
+        }
         let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count() as u32;
         if self.eta.due(at, left) {
-            let speed = self.rate.rate().unwrap_or(0.0);
-            // Seconds the active item's download still needs at the recent average speed.
-            let download = live
-                .rows
-                .iter()
-                .find(|row| row.kind == RowKind::Active)
-                .filter(|row| row.size > 0 && row.fraction < 1.0 && speed > 0.0)
-                .map(|row| row.size.saturating_sub(row.copied) as f64 / speed);
-            let wait = if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 };
-            let estimate = readout::time_left(at, self.finished, self.last_finish, left, download, wait);
-            self.eta.sync(at, left, estimate);
+            let speed = self.rate.rate().filter(|speed| *speed > 0.0);
+            let convert_avg = (self.convert_count > 0).then(|| self.convert_total / self.convert_count as f64);
+            let download = active
+                .filter(|row| row.size > 0 && row.fraction < 1.0 && row.convert == 0.0)
+                .and_then(|row| speed.map(|speed| row.size.saturating_sub(row.copied) as f64 / speed));
+            let convert_left = match (self.converting, convert_avg) {
+                (Some((_, start)), Some(avg)) if active.is_some_and(|row| row.convert > 0.0) => Some((avg - (at - start)).max(0.0)),
+                _ => None,
+            };
+            let job = readout::Job {
+                elapsed: at,
+                finished: self.finished,
+                last_finish: self.last_finish,
+                left,
+                download,
+                convert_left,
+                waiting,
+                convert_avg,
+                bytes_per_item: (self.download_count > 0).then(|| self.download_bytes as f64 / self.download_count as f64),
+                speed,
+                // The app waits a random min..max seconds before each next item.
+                wait: if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 },
+            };
+            self.eta.sync(at, left, readout::time_left(&job));
+        } else {
+            self.eta.tick(at);
         }
     }
 
@@ -2928,8 +2982,8 @@ impl App {
         }
         let (speed, items) = speed_of(self);
         let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count();
-        // Counts down every second between the five-second updates in `track_speed`.
-        let estimate = self.eta.show(self.sample_start.elapsed().as_secs_f64());
+        // Counts down between the five-second updates in `track_speed`, easing toward each new one.
+        let estimate = self.eta.show();
         let eta = if live.done || left == 0 {
             "—".to_string()
         } else if let Some(seconds) = estimate {
