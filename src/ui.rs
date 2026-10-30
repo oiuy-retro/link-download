@@ -1,7 +1,6 @@
 //! Windows 98 wizard. Classic controls, MS Sans Serif, no visual styles.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -305,7 +304,9 @@ struct App {
     rows: Vec<WorkRow>,
     list_hwnd: HWND,
     list_scroll: i32,
-    samples: VecDeque<(Instant, u64)>,
+    /// Download speed averaged over the last five seconds. Speed and Time left both use it.
+    rate: readout::RollingRate,
+    eta: readout::Countdown,
     sample_start: Instant,
     last_done: u32,
     base_done: Option<u32>,
@@ -890,7 +891,8 @@ impl App {
             rows: Vec::new(),
             list_hwnd: null,
             list_scroll: 0,
-            samples: VecDeque::new(),
+            rate: readout::RollingRate::new(5.0),
+            eta: readout::Countdown::new(),
             sample_start: Instant::now(),
             last_done: 0,
             base_done: None,
@@ -2791,7 +2793,8 @@ impl App {
     }
 
     fn reset_speed(&mut self) {
-        self.samples.clear();
+        self.rate.clear();
+        self.eta = readout::Countdown::new();
         self.sample_start = Instant::now();
         self.last_done = 0;
         self.base_done = None;
@@ -2877,10 +2880,8 @@ impl App {
     fn track_speed(&mut self, live: &Live) {
         let now = Instant::now();
         let bytes = live.banked_bytes.saturating_add(live.current_bytes);
-        self.samples.push_back((now, bytes));
-        while self.samples.len() > 2 && now.saturating_duration_since(self.samples[0].0).as_millis() > 2000 {
-            self.samples.pop_front();
-        }
+        let at = now.saturating_duration_since(self.sample_start).as_secs_f64();
+        self.rate.push(at, bytes);
         // Items pinned before the run starts count as done but took no time. Leave them out.
         if live.total == 0 {
             return;
@@ -2892,6 +2893,20 @@ impl App {
             self.last_finish = now.saturating_duration_since(self.sample_start).as_secs_f64();
         }
         self.last_done = done;
+        let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count() as u32;
+        if self.eta.due(at, left) {
+            let speed = self.rate.rate().unwrap_or(0.0);
+            // Seconds the active item's download still needs at the recent average speed.
+            let download = live
+                .rows
+                .iter()
+                .find(|row| row.kind == RowKind::Active)
+                .filter(|row| row.size > 0 && row.fraction < 1.0 && speed > 0.0)
+                .map(|row| row.size.saturating_sub(row.copied) as f64 / speed);
+            let wait = if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 };
+            let estimate = readout::time_left(at, self.finished, self.last_finish, left, download, wait);
+            self.eta.sync(at, left, estimate);
+        }
     }
 
     fn paint_readouts(&self, live: &Live) {
@@ -2913,9 +2928,8 @@ impl App {
         }
         let (speed, items) = speed_of(self);
         let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count();
-        let progress = live.rows.iter().find(|row| row.kind == RowKind::Active).map(|row| (row.fraction + row.convert) * 0.5);
-        let wait = if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 };
-        let estimate = readout::time_left(self.sample_start.elapsed().as_secs_f64(), self.finished, self.last_finish, left as u32, progress, wait);
+        // Counts down every second between the five-second updates in `track_speed`.
+        let estimate = self.eta.show(self.sample_start.elapsed().as_secs_f64());
         let eta = if live.done || left == 0 {
             "—".to_string()
         } else if let Some(seconds) = estimate {
@@ -3078,14 +3092,7 @@ fn popup_for(id: i32, code: u16, leaving_for_own_control: bool) -> bool {
 }
 
 fn speed_of(app: &App) -> (f64, f64) {
-    let speed = if app.samples.len() >= 2 {
-        let older = app.samples.front().unwrap();
-        let newer = app.samples.back().unwrap();
-        let seconds = newer.0.saturating_duration_since(older.0).as_secs_f64().max(0.2);
-        (newer.1.saturating_sub(older.1) as f64) / seconds
-    } else {
-        0.0
-    };
+    let speed = app.rate.rate().unwrap_or(0.0);
     // Whole run, waits included, so it agrees with Time left.
     let run = app.sample_start.elapsed().as_secs_f64().max(0.25);
     let items = app.finished as f64 / run;
