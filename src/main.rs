@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod classify;
+mod conf;
 mod classic;
 mod commands;
 mod model;
