@@ -123,15 +123,15 @@ impl ItemProgress {
 }
 
 pub fn tool_args(node: &Path, ffmpeg_dir: &Path) -> Vec<String> {
-    // `node:C:\...` is split on the drive-letter colon, so the runtime is the
-    // node.exe sitting in the program folder. Callers run yt-dlp with that folder
-    // as the working directory.
-    let _ = node;
+    // The runtime is given by file name only, and callers run yt-dlp in node's
+    // folder (tools::node_dir), so no drive-letter colon ever reaches the
+    // `RUNTIME:PATH` value.
+    let node_name = node.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "node.exe".into());
     vec![
         "--ignore-config".into(),
         "--no-colors".into(),
         "--js-runtimes".into(),
-        "node:node.exe".into(),
+        format!("node:{node_name}"),
         "--ffmpeg-location".into(),
         ffmpeg_dir.display().to_string(),
     ]
@@ -798,6 +798,13 @@ mod tests {
         assert_eq!(parse_expected_bytes("expected_bytes:0"), None);
         assert_eq!(parse_expected_bytes("download:downloading|1|2|NA|3"), None);
         assert!(parse_progress("expected_bytes:437474").is_none());
+    }
+
+    #[test]
+    fn tool_args_pass_resolved_node_and_ffmpeg() {
+        let args = tool_args(Path::new("D:\\apps\\node\\node22.exe"), Path::new("D:\\apps\\ffmpeg\\bin"));
+        assert!(has_pair(&args, "--js-runtimes", "node:node22.exe"));
+        assert!(has_pair(&args, "--ffmpeg-location", "D:\\apps\\ffmpeg\\bin"));
     }
 
     #[test]

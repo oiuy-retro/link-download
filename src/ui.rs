@@ -373,6 +373,8 @@ impl LiveEdit {
 }
 
 pub fn run() -> i32 {
+    // Writes the commented configuration.conf template on first start.
+    let _ = crate::conf::load();
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
