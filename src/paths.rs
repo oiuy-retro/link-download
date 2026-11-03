@@ -44,11 +44,17 @@ pub fn name_marks(name: &str) -> Vec<(char, Mark)> {
         })
         .collect();
     if !name.trim().is_empty() {
-        if let Some(last) = marks.last_mut() {
+        // Every period and space in the run at the end goes, so `Title......` marks all six.
+        for last in marks.iter_mut().rev() {
+            if last.1 != Mark::Plain {
+                break;
+            }
             if last.0 == ' ' {
                 *last = (SPACE_MARK, Mark::End);
             } else if last.0 == '.' {
                 last.1 = Mark::End;
+            } else {
+                break;
             }
         }
     }
@@ -88,6 +94,96 @@ pub fn sanitize(name: &str) -> String {
         text = text.trim().trim_end_matches(['.', ' ']).to_string();
     }
     if text.is_empty() { "Untitled".into() } else { text }
+}
+
+/// True when the part before the first period is a device name Windows keeps for itself,
+/// such as CON or COM1, in any case and with or without spaces around it.
+pub fn is_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// What the Names page's Fix Names button turns a name into. The name is the file name
+/// without its extension, which the app adds later.
+///
+/// - Each character Windows forbids is deleted: `< > : " / \ |  ? *` and control characters.
+///   These are the characters the warning line draws in bold.
+/// - Where a deletion leaves two spaces side by side, one is dropped, so `A : B` becomes `A B`.
+///   Double spaces that were already in the name are kept.
+/// - Spaces at the start and end go, and so do periods and spaces at the end, which Windows
+///   would drop on its own: `Title......` and `Title. . .` become `Title`. The `…` character
+///   and periods inside the name are kept.
+/// - A name over 250 characters is cut to 250, then its end is tidied the same way.
+/// - A reserved device name gets `_` after the device part: `CON` becomes `CON_`,
+///   `nul.live` becomes `nul_.live`.
+/// - A name with nothing left uses `fallback` (the video's own title) cleaned the same way,
+///   and `Untitled` when that is empty too.
+pub fn fix_name(name: &str, fallback: &str) -> String {
+    let cleaned = clean_once(name);
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    let cleaned = clean_once(fallback);
+    if cleaned.is_empty() { "Untitled".into() } else { cleaned }
+}
+
+fn clean_once(name: &str) -> String {
+    let mut out = String::new();
+    let mut deleted = false;
+    for ch in name.chars() {
+        if is_invalid_char(ch) {
+            deleted = true;
+            continue;
+        }
+        if ch == ' ' && deleted && out.ends_with(' ') {
+            continue;
+        }
+        if ch != ' ' {
+            deleted = false;
+        }
+        out.push(ch);
+    }
+    let mut text = tidy_ends(&out);
+    if text.chars().count() > 250 {
+        text = tidy_ends(&text.chars().take(250).collect::<String>());
+    }
+    if !text.is_empty() && is_reserved_name(&text) {
+        let cut = text.find('.').unwrap_or(text.len());
+        let stem_end = text[..cut].trim_end().len();
+        text.insert(stem_end, '_');
+    }
+    text
+}
+
+fn tidy_ends(text: &str) -> String {
+    let mut text = text.trim();
+    loop {
+        let next = text.trim_end_matches(['.', ' ']).trim_end();
+        if next.len() == text.len() {
+            break;
+        }
+        text = next;
+    }
+    text.to_string()
+}
+
+/// True when Fix Names would change at least one name in this list.
+pub fn names_fixable(items: &[crate::model::Item]) -> bool {
+    items
+        .iter()
+        .filter(|item| item.blocked.is_none())
+        .any(|item| filename_problem(&item.title).is_some() && fix_name(&item.title, &item.original_title) != item.title)
 }
 
 /// The first illegal file name in this list, or nothing when every saved name is legal.
@@ -130,19 +226,7 @@ pub fn filename_problem(name: &str) -> Option<&'static str> {
     if name.chars().count() > 250 {
         return Some("That file name is too long.");
     }
-    let stem = name.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
-    if matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    ) {
+    if is_reserved_name(name) {
         return Some("That file name is reserved by Windows.");
     }
     None
@@ -621,6 +705,10 @@ mod tests {
         assert_eq!(marked("Ends in a star*"), "Ends in a star[*]");
         assert_eq!(marked("Ctrl\u{7}char"), "Ctrl[\u{a4}]char");
         assert_eq!(marked("1.5 inner dots. ok"), "1.5 inner dots. ok");
+        assert_eq!(marked("Title......"), "Title{.}{.}{.}{.}{.}{.}");
+        assert_eq!(marked("Title. . ."), "Title{.}{\u{b7}}{.}{\u{b7}}{.}");
+        assert_eq!(marked("Wait\u{2026}"), "Wait\u{2026}");
+        assert_eq!(marked("Why?.."), "Why[?]{.}{.}");
         // Reserved and long names are a whole-name problem.
         assert_eq!(marked("CON"), "CON");
         assert_eq!(marked(&"x".repeat(300)), "x".repeat(300));
@@ -653,5 +741,78 @@ mod tests {
         assert!(line.contains("2 names"));
         assert!(name_problem_line(&[blocked]).is_none());
         assert!(name_problem_line(&[item("Fine", &[])]).is_none());
+    }
+
+    #[test]
+    fn fix_deletes_each_forbidden_character() {
+        assert_eq!(fix_name("a<b>c:d\"e/f\\g|h?i*j", "x"), "abcdefghij");
+        assert_eq!(fix_name("Tab\there\u{7}\u{0}\u{1f}", "x"), "Tabhere");
+        assert_eq!(fix_name("Song: Live", "x"), "Song Live");
+        assert_eq!(fix_name("What?", "x"), "What");
+        assert_eq!(fix_name("AC/DC", "x"), "ACDC");
+    }
+
+    #[test]
+    fn fix_drops_trailing_periods_and_spaces() {
+        assert_eq!(fix_name("Title......", "x"), "Title");
+        assert_eq!(fix_name("Title. . .", "x"), "Title");
+        assert_eq!(fix_name("Title .", "x"), "Title");
+        assert_eq!(fix_name("  Title  ", "x"), "Title");
+        assert_eq!(fix_name("Title?...", "x"), "Title");
+        assert_eq!(fix_name("Title...?", "x"), "Title");
+        assert_eq!(fix_name("Wait\u{2026}", "x"), "Wait\u{2026}");
+        assert_eq!(fix_name("Wait\u{2026}...", "x"), "Wait\u{2026}");
+        assert_eq!(fix_name("Mr. Blue Sky...", "x"), "Mr. Blue Sky");
+        assert_eq!(fix_name("v1.2.3 build", "x"), "v1.2.3 build");
+    }
+
+    #[test]
+    fn fix_collapses_only_the_spaces_a_deletion_left() {
+        assert_eq!(fix_name("A : B", "x"), "A B");
+        assert_eq!(fix_name("A | | B", "x"), "A B");
+        assert_eq!(fix_name("A  B?", "x"), "A  B");
+        assert_eq!(fix_name("A:B", "x"), "AB");
+    }
+
+    #[test]
+    fn fix_marks_reserved_device_names() {
+        assert_eq!(fix_name("CON", "x"), "CON_");
+        assert_eq!(fix_name("con", "x"), "con_");
+        assert_eq!(fix_name("nul.live", "x"), "nul_.live");
+        assert_eq!(fix_name("COM1.", "x"), "COM1_");
+        assert_eq!(fix_name("LPT9 .x", "x"), "LPT9_ .x");
+        assert_eq!(fix_name("AUX?", "x"), "AUX_");
+        assert!(filename_problem(&fix_name("PRN", "x")).is_none());
+        assert_eq!(fix_name("CONTROL", "x"), "CONTROL");
+        assert_eq!(fix_name("COM10", "x"), "COM10");
+    }
+
+    #[test]
+    fn fix_never_leaves_an_empty_name() {
+        assert_eq!(fix_name("???", "Song: Live"), "Song Live");
+        assert_eq!(fix_name("...", ""), "Untitled");
+        assert_eq!(fix_name("   ", "|||"), "Untitled");
+        assert_eq!(fix_name("", "CON"), "CON_");
+    }
+
+    #[test]
+    fn fix_keeps_unicode_and_clean_names() {
+        for name in ["Song", "Caf\u{e9} \u{3042}\u{3044}", "\u{1f3b5} Track", "A - B (Live)", "Wait\u{2026}", "A  B", "x.y"] {
+            assert_eq!(fix_name(name, "other"), name);
+        }
+        assert_eq!(fix_name("\u{3042}:\u{3044}", "x"), "\u{3042}\u{3044}");
+        assert_eq!(fix_name("\u{ff1a}ok", "x"), "\u{ff1a}ok");
+    }
+
+    #[test]
+    fn fix_cuts_long_names_and_every_result_is_legal() {
+        let long = format!("{}.... end", "a".repeat(248));
+        let fixed = fix_name(&long, "x");
+        assert_eq!(fixed, "a".repeat(248));
+        for name in ["Title......", "A : B", "CON", "???", " . ", "a\u{0}b. ", "nul.live", &long] {
+            let fixed = fix_name(name, "Fallback");
+            assert!(filename_problem(&fixed).is_none(), "{name:?} -> {fixed:?}");
+            assert_eq!(fix_name(&fixed, "Fallback"), fixed, "fixing twice changes nothing");
+        }
     }
 }

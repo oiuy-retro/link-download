@@ -115,6 +115,7 @@ const ID_ARTIST: i32 = 9000;
 const ID_RESET: i32 = 16000;
 const ID_META_RESET: i32 = 17000;
 const ID_NAME_ERROR: i32 = 18000;
+const ID_FIX_NAMES: i32 = 19000;
 const ID_TITLE_SAME_ALL: i32 = 21000;
 const ID_TITLE_FIELD: i32 = 22000;
 const ID_TITLE_SAME: i32 = 43000;
@@ -1423,9 +1424,14 @@ impl App {
             fill_titles(list, &titles, w - self.s(24));
             y += list_h + self.s(4);
             // SS_OWNERDRAW, so the characters that make the name illegal can be drawn in bold.
-            let error = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x000D, 0, self.s(8), y, w - self.s(16), self.s(32), 0, 0);
+            let fix_w = self.s(75);
+            let error = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x000D, 0, self.s(8), y, w - self.s(24) - fix_w, self.s(32), 0, 0);
             set_id(error, ID_NAME_ERROR + group_index as i32);
+            self.set_anchor(error, Anchor::StretchX);
             show_name_error(error, &self.groups[group_index].items);
+            let fix = self.button(w - self.s(8) - fix_w, y, fix_w, "Fi&x Names", ID_FIX_NAMES + group_index as i32, false);
+            self.set_anchor(fix, Anchor::Right);
+            set_enabled(fix, paths::names_fixable(&self.groups[group_index].items));
             y += self.s(36);
         }
         y
@@ -1973,6 +1979,9 @@ impl App {
             if let Ok(label) = child(self.pane(), ID_NAME_ERROR + index as i32) {
                 show_name_error(label, &group.items);
             }
+            if let Ok(fix) = child(self.pane(), ID_FIX_NAMES + index as i32) {
+                set_enabled(fix, paths::names_fixable(&group.items));
+            }
         }
     }
 
@@ -2104,6 +2113,10 @@ impl App {
         }
         if code == 0 && (ID_META_RESET..ID_NAME_ERROR).contains(&id) {
             self.reset_meta((id - ID_META_RESET) as usize);
+            return Action::None;
+        }
+        if code == 0 && self.page == 2 && (ID_FIX_NAMES..ID_FIX_NAMES + GROUP_LIMIT as i32).contains(&id) {
+            self.fix_names((id - ID_FIX_NAMES) as usize);
             return Action::None;
         }
         if code == 0 && (ID_TITLE_SAME_ALL..ID_TITLE_FIELD).contains(&id) {
@@ -2677,6 +2690,34 @@ impl App {
         }
     }
 
+    /// Fix Names: every name in this list that the warning line flags is cleaned with
+    /// `paths::fix_name`. Legal names and blocked videos are left alone.
+    fn fix_names(&mut self, group: usize) {
+        let Ok(list) = child(self.pane(), ID_LIST + group as i32) else {
+            return;
+        };
+        let Some(source) = self.groups.get_mut(group) else {
+            return;
+        };
+        for (index, item) in source.items.iter_mut().enumerate() {
+            if item.blocked.is_some() || paths::filename_problem(&item.title).is_none() {
+                continue;
+            }
+            let next = paths::fix_name(&item.title, &item.original_title);
+            if next != item.title {
+                set_list_text(list, index as i32, &next);
+                item.title = next;
+            }
+        }
+        unsafe { let _ = InvalidateRect(list, None, true); }
+        let focus = unsafe { GetFocus() };
+        self.refresh_nav();
+        // The button greys out once nothing is left to fix. Keep the keyboard on the list then.
+        if !focus.0.is_null() && unsafe { IsWindowEnabled(focus).0 } == 0 {
+            unsafe { let _ = SetFocus(list); }
+        }
+    }
+
     fn reset_names(&mut self, group: usize) {
         let Some(source) = self.groups.get_mut(group) else {
             return;
@@ -3019,6 +3060,9 @@ impl App {
             for index in 0..self.groups.len().min(GROUP_LIMIT) {
                 if let Ok(reset) = child(self.pane(), ID_RESET + index as i32) {
                     add_tip(self, reset, "Put the file names back");
+                }
+                if let Ok(fix) = child(self.pane(), ID_FIX_NAMES + index as i32) {
+                    add_tip(self, fix, "Delete the characters Windows does not allow, and the periods and spaces at the end");
                 }
             }
         }
