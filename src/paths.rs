@@ -114,7 +114,7 @@ pub fn is_reserved_name(name: &str) -> bool {
     )
 }
 
-/// What the Names page's Fix Names button turns a name into. The name is the file name
+/// What the Names page's Delete Invalid Characters button turns a name into. The name is the file name
 /// without its extension, which the app adds later.
 ///
 /// - Each character Windows forbids is deleted: `< > : " / \ |  ? *` and control characters.
@@ -178,7 +178,7 @@ fn tidy_ends(text: &str) -> String {
     text.to_string()
 }
 
-/// True when Fix Names would change at least one name in this list.
+/// True when Delete Invalid Characters would change at least one name in this list.
 pub fn names_fixable(items: &[crate::model::Item]) -> bool {
     items
         .iter()

@@ -1424,12 +1424,12 @@ impl App {
             fill_titles(list, &titles, w - self.s(24));
             y += list_h + self.s(4);
             // SS_OWNERDRAW, so the characters that make the name illegal can be drawn in bold.
-            let fix_w = self.s(75);
+            let fix_w = self.s(150);
             let error = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x000D, 0, self.s(8), y, w - self.s(24) - fix_w, self.s(32), 0, 0);
             set_id(error, ID_NAME_ERROR + group_index as i32);
             self.set_anchor(error, Anchor::StretchX);
             show_name_error(error, &self.groups[group_index].items);
-            let fix = self.button(w - self.s(8) - fix_w, y, fix_w, "Fi&x Names", ID_FIX_NAMES + group_index as i32, false);
+            let fix = self.button(w - self.s(8) - fix_w, y, fix_w, "&Delete Invalid Characters", ID_FIX_NAMES + group_index as i32, false);
             self.set_anchor(fix, Anchor::Right);
             set_enabled(fix, paths::names_fixable(&self.groups[group_index].items));
             y += self.s(36);
@@ -2690,7 +2690,7 @@ impl App {
         }
     }
 
-    /// Fix Names: every name in this list that the warning line flags is cleaned with
+    /// Delete Invalid Characters: every name in this list that the warning line flags is cleaned with
     /// `paths::fix_name`. Legal names and blocked videos are left alone.
     fn fix_names(&mut self, group: usize) {
         let Ok(list) = child(self.pane(), ID_LIST + group as i32) else {
