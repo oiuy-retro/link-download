@@ -54,6 +54,8 @@ pub struct Live {
     pub total: u32,
     pub done: bool,
     pub error: String,
+    /// Pauses still to run, in the order they will be waited. Rolled once at the start.
+    pub waits: Vec<u32>,
 }
 
 impl Live {
@@ -68,6 +70,7 @@ impl Live {
             total: 0,
             done: false,
             error: String::new(),
+            waits: Vec::new(),
         }
     }
 }
@@ -151,8 +154,16 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
         live.bad = already_bad;
         live.rows = rows;
     }
+    let attempts = plan_attempts(&opts, &groups);
     let mut rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1);
-    let mut seen = 0u32;
+    {
+        let mut live = shared.live.lock().expect("live");
+        live.waits = commands::wait_plan(attempts.len(), opts.min_wait, opts.max_wait, &mut rng);
+    }
+    if !attempts.is_empty() && !read_sizes(&shared, &ytdlp, &node, &ffmpeg_dir, &opts, &attempts) {
+        finish(&shared, groups, "");
+        return;
+    }
     // Finished-file paths that items of this run are heading for. Two items with
     // the same title in the same folder must not make the second one look
     // "Already saved" because the first one just made that file.
@@ -176,7 +187,6 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             }
         }
         for (index, item) in group.items.iter_mut().enumerate() {
-            seen += 1;
             if cancelled(&shared) {
                 finish(&shared, groups, "");
                 return;
@@ -215,6 +225,10 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             if let Err(err) = fs::create_dir_all(dir) {
                 fail(&shared, row_id, &err.to_string());
                 journal(&format!("could not create {}: {err}", dir.display()));
+                if !end_attempt(&shared, false) {
+                    finish(&shared, groups, "");
+                    return;
+                }
                 continue;
             }
             // yt-dlp downloads into a hidden folder inside the music folder, one
@@ -225,6 +239,10 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             if let Err(err) = partial::prepare(Path::new(&opts.location)).and_then(|_| fs::create_dir_all(&work)) {
                 fail(&shared, row_id, &err.to_string());
                 journal(&format!("could not create {}: {err}", work.display()));
+                if !end_attempt(&shared, false) {
+                    finish(&shared, groups, "");
+                    return;
+                }
                 continue;
             }
             let stem = paths::download_stem(&work, &item.title);
@@ -309,12 +327,11 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                     fail(&shared, row_id, "The download finished without a file.");
                 }
             }
-            if fetched_now && seen < jobs {
-                let seconds = commands::wait_seconds(opts.min_wait, opts.max_wait, &mut rng);
-                if seconds > 0 && !countdown(&shared, next_queued(&shared), seconds, "Waiting") {
-                    finish(&shared, groups, "");
-                    return;
-                }
+            // The pause after this file was rolled at the start. A failed download
+            // drops its pause, because nothing is waited then.
+            if !end_attempt(&shared, fetched_now) {
+                finish(&shared, groups, "");
+                return;
             }
         }
     }
@@ -794,6 +811,168 @@ fn trim_log(text: &mut String) {
         }
         text.drain(..cut);
     }
+}
+
+struct Attempt {
+    row_id: u64,
+    id: String,
+    url: String,
+    playlist_item: Option<u32>,
+}
+
+/// Items this run will download, in the order the loop downloads them.
+/// Already saved files, and files still waiting to be converted, are left out.
+/// Keep these checks in step with the download loop.
+fn plan_attempts(opts: &Options, groups: &[Group]) -> Vec<Attempt> {
+    let mut claimed = std::collections::HashSet::new();
+    let mut attempts = Vec::new();
+    for group in groups {
+        let dirs: Vec<PathBuf> = (0..group.items.len())
+            .map(|index| paths::output_dir(Path::new(&opts.location), group, index))
+            .collect();
+        for (index, item) in group.items.iter().enumerate() {
+            if item.blocked.is_some() || (item.download_url.is_empty() && item.playlist_item.is_none()) {
+                continue;
+            }
+            let finished = paths::final_file(&dirs[index], &item.title, opts.container.extension());
+            let waiting = item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false);
+            let mine_earlier = claimed.contains(&finished);
+            if !opts.overwrite && !waiting && !mine_earlier && finished.is_file() {
+                continue;
+            }
+            claimed.insert(finished);
+            if item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false) {
+                continue;
+            }
+            attempts.push(Attempt {
+                row_id: row_id_for(group, index),
+                id: item.id.clone(),
+                url: item.download_url.clone(),
+                playlist_item: item.playlist_item,
+            });
+        }
+    }
+    attempts
+}
+
+/// Asks yt-dlp for each file's size and stores it on the row. False means Cancel.
+fn read_sizes(shared: &Shared, ytdlp: &Path, node: &Path, ffmpeg_dir: &Path, opts: &Options, attempts: &[Attempt]) -> bool {
+    set_status(shared, "Reading sizes…");
+    let mut sizes = std::collections::HashMap::<String, u64>::new();
+    let direct = unique_in_order(attempts.iter().filter(|attempt| attempt.playlist_item.is_none()).map(|attempt| attempt.url.as_str()));
+    for chunk in direct.chunks(40) {
+        if !collect_sizes(shared, ytdlp, node, ffmpeg_dir, opts, chunk, None, &mut sizes) {
+            return false;
+        }
+    }
+    for (url, items) in playlist_groups(attempts) {
+        if !collect_sizes(shared, ytdlp, node, ffmpeg_dir, opts, &[url.as_str()], Some(items.as_str()), &mut sizes) {
+            return false;
+        }
+    }
+    let mut matched = 0usize;
+    for attempt in attempts {
+        if let Some(bytes) = sizes.get(&attempt.id) {
+            set_row_size(shared, attempt.row_id, *bytes);
+            matched += 1;
+        }
+    }
+    journal(&format!("sizes known for {matched} of {} downloads", attempts.len()));
+    true
+}
+
+fn unique_in_order<'a>(urls: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for url in urls {
+        if url.is_empty() || !seen.insert(url) {
+            continue;
+        }
+        out.push(url);
+    }
+    out
+}
+
+fn playlist_groups(attempts: &[Attempt]) -> Vec<(String, String)> {
+    let mut order = Vec::new();
+    let mut groups = std::collections::HashMap::<String, Vec<u32>>::new();
+    for attempt in attempts.iter().filter(|attempt| attempt.playlist_item.is_some()) {
+        let index = attempt.playlist_item.unwrap();
+        if !groups.contains_key(&attempt.url) {
+            order.push(attempt.url.clone());
+        }
+        let items = groups.entry(attempt.url.clone()).or_default();
+        if !items.contains(&index) {
+            items.push(index);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|url| {
+            let items = groups.remove(&url)?;
+            let text = items.iter().map(|index| index.to_string()).collect::<Vec<_>>().join(",");
+            Some((url, text))
+        })
+        .collect()
+}
+
+/// False means Cancel. Any other failure leaves those sizes unknown.
+fn collect_sizes(
+    shared: &Shared,
+    ytdlp: &Path,
+    node: &Path,
+    ffmpeg_dir: &Path,
+    opts: &Options,
+    urls: &[&str],
+    playlist_items: Option<&str>,
+    sizes: &mut std::collections::HashMap<String, u64>,
+) -> bool {
+    if urls.is_empty() {
+        return true;
+    }
+    let owned: Vec<String> = urls.iter().map(|url| (*url).to_string()).collect();
+    let args = commands::size_args(opts, &owned, playlist_items, node, ffmpeg_dir);
+    match run_command(shared, ytdlp, &args, Some(ffmpeg_dir), true, |_| {}) {
+        Ok(output) => {
+            for line in output.stdout.lines() {
+                if let Some((id, bytes)) = commands::parse_size_line(line) {
+                    sizes.insert(id, bytes);
+                }
+            }
+            true
+        }
+        Err(err) if err == "Stopped." => false,
+        Err(err) => {
+            journal(&format!("sizes were not read ({err})"));
+            true
+        }
+    }
+}
+
+fn set_row_size(shared: &Shared, id: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    if let Some(row) = shared.live.lock().expect("live").rows.iter_mut().find(|row| row.id == id) {
+        row.size = size;
+    }
+}
+
+fn pop_wait(shared: &Shared) -> Option<u32> {
+    let mut live = shared.live.lock().expect("live");
+    if live.waits.is_empty() { None } else { Some(live.waits.remove(0)) }
+}
+
+/// Uses the next pre-rolled pause when the download worked. A failure drops that
+/// pause. False means Cancel was pressed during the pause.
+fn end_attempt(shared: &Shared, fetched_now: bool) -> bool {
+    let Some(seconds) = pop_wait(shared) else {
+        return true;
+    };
+    if !fetched_now || seconds == 0 {
+        return true;
+    }
+    countdown(shared, next_queued(shared), seconds, "Waiting")
 }
 
 fn countdown(shared: &Shared, row_id: u64, seconds: u32, label: &str) -> bool {

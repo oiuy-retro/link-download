@@ -1,7 +1,6 @@
 //! Windows 98 wizard. Classic controls, MS Sans Serif, no visual styles.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -306,7 +305,15 @@ struct App {
     rows: Vec<WorkRow>,
     list_hwnd: HWND,
     list_scroll: i32,
-    samples: VecDeque<(Instant, u64)>,
+    /// Download speed, smoothed over about five seconds. Speed and Time left both use it.
+    rate: readout::SmoothRate,
+    eta: readout::Countdown,
+    /// The active item that is converting, and when its convert started.
+    converting: Option<(u64, f64)>,
+    convert_total: f64,
+    convert_count: u32,
+    download_bytes: u64,
+    download_count: u32,
     sample_start: Instant,
     last_done: u32,
     base_done: Option<u32>,
@@ -891,7 +898,13 @@ impl App {
             rows: Vec::new(),
             list_hwnd: null,
             list_scroll: 0,
-            samples: VecDeque::new(),
+            rate: readout::SmoothRate::new(5.0),
+            eta: readout::Countdown::new(),
+            converting: None,
+            convert_total: 0.0,
+            convert_count: 0,
+            download_bytes: 0,
+            download_count: 0,
             sample_start: Instant::now(),
             last_done: 0,
             base_done: None,
@@ -2832,7 +2845,13 @@ impl App {
     }
 
     fn reset_speed(&mut self) {
-        self.samples.clear();
+        self.rate.clear();
+        self.eta = readout::Countdown::new();
+        self.converting = None;
+        self.convert_total = 0.0;
+        self.convert_count = 0;
+        self.download_bytes = 0;
+        self.download_count = 0;
         self.sample_start = Instant::now();
         self.last_done = 0;
         self.base_done = None;
@@ -2918,21 +2937,84 @@ impl App {
     fn track_speed(&mut self, live: &Live) {
         let now = Instant::now();
         let bytes = live.banked_bytes.saturating_add(live.current_bytes);
-        self.samples.push_back((now, bytes));
-        while self.samples.len() > 2 && now.saturating_duration_since(self.samples[0].0).as_millis() > 2000 {
-            self.samples.pop_front();
-        }
+        let at = now.saturating_duration_since(self.sample_start).as_secs_f64();
+        // The app's own pause between items (see run::countdown). Nothing downloads in
+        // it, so it is left out of the speed.
+        let waiting = live.rows.iter().find(|row| row.kind == RowKind::Waiting).and_then(|row| readout::waiting_seconds(&row.note));
+        let active_now = live.rows.iter().find(|row| row.kind == RowKind::Active);
+        // Converting adds no bytes, so leave it out of the speed or Time left shoots up.
+        let converting = active_now.is_some_and(|row| row.convert > 0.0);
+        self.rate.push(at, bytes, waiting.is_some() || converting);
         // Items pinned before the run starts count as done but took no time. Leave them out.
         if live.total == 0 {
             return;
         }
         let done = live.ok.saturating_add(live.bad);
         let base = *self.base_done.get_or_insert(done);
+        let active = live.rows.iter().find(|row| row.kind == RowKind::Active);
         if done > self.last_done.max(base) {
             self.finished = done - base;
-            self.last_finish = now.saturating_duration_since(self.sample_start).as_secs_f64();
+            self.last_finish = at;
+            // The item that was converting is done: count how long its convert took.
+            if let Some((id, start)) = self.converting.take() {
+                if active.map(|row| row.id) != Some(id) {
+                    self.convert_total += at - start;
+                    self.convert_count += 1;
+                } else {
+                    self.converting = Some((id, start));
+                }
+            }
         }
         self.last_done = done;
+        let mut convert_just_started = false;
+        if let Some(row) = active {
+            if row.convert > 0.0 && self.converting.map(|(id, _)| id) != Some(row.id) {
+                // Its download just finished. Remember its size for the items after it.
+                convert_just_started = true;
+                self.converting = Some((row.id, at));
+                if row.size > 0 {
+                    self.download_bytes = self.download_bytes.saturating_add(row.size);
+                    self.download_count += 1;
+                }
+            }
+        }
+        let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count() as u32;
+        // Refresh when the schedule says so, and once when a convert starts so the
+        // finished download drops out. After that, hold: syncing every frame would
+        // keep counting the clock down, then the number would jump back.
+        let refresh = self.eta.due(at, left) || convert_just_started;
+        if refresh {
+            let speed = self.rate.rate().filter(|speed| *speed > 0.0);
+            let convert_avg = (self.convert_count > 0).then(|| self.convert_total / self.convert_count as f64);
+            let download = active
+                .filter(|row| row.size > 0 && row.fraction < 1.0 && row.convert == 0.0)
+                .and_then(|row| speed.map(|speed| row.size.saturating_sub(row.copied) as f64 / speed));
+            // Present means "this file is converting." The seconds are not used.
+            let convert_left = converting.then_some(0.0);
+            let downloading = self.busy == Busy::Download;
+            let job = readout::Job {
+                elapsed: at,
+                finished: self.finished,
+                last_finish: self.last_finish,
+                left,
+                download,
+                convert_left,
+                waiting,
+                convert_avg,
+                bytes_per_item: (self.download_count > 0).then(|| self.download_bytes as f64 / self.download_count as f64),
+                speed,
+                // Used only when the pauses were not rolled ahead of the run.
+                wait: if downloading { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 },
+                bytes_left: downloading.then(|| planned_bytes(live)).flatten(),
+                waits_left: downloading.then(|| live.waits.iter().map(|seconds| *seconds as f64).sum()),
+            };
+            self.eta.sync(at, left, readout::time_left(&job));
+        }
+        if converting {
+            self.eta.hold(at);
+        } else if !refresh {
+            self.eta.tick(at);
+        }
     }
 
     fn paint_readouts(&self, live: &Live) {
@@ -2954,9 +3036,8 @@ impl App {
         }
         let (speed, items) = speed_of(self);
         let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count();
-        let progress = live.rows.iter().find(|row| row.kind == RowKind::Active).map(|row| (row.fraction + row.convert) * 0.5);
-        let wait = if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 };
-        let estimate = readout::time_left(self.sample_start.elapsed().as_secs_f64(), self.finished, self.last_finish, left as u32, progress, wait);
+        // Counts down between the five-second updates in `track_speed`, easing toward each new one.
+        let estimate = self.eta.show();
         let eta = if live.done || left == 0 {
             "—".to_string()
         } else if let Some(seconds) = estimate {
@@ -3121,15 +3202,19 @@ fn popup_for(id: i32, code: u16, leaving_for_own_control: bool) -> bool {
     code != EN_CHANGE as u16 && code != EN_KILLFOCUS as u16
 }
 
+/// Sizes still to download. A row that is converting has already finished its download.
+fn planned_bytes(live: &Live) -> Option<f64> {
+    let items: Vec<(u64, u64)> = live
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Waiting) || (row.kind == RowKind::Active && row.convert == 0.0))
+        .map(|row| (row.size, row.copied))
+        .collect();
+    readout::bytes_remaining(&items)
+}
+
 fn speed_of(app: &App) -> (f64, f64) {
-    let speed = if app.samples.len() >= 2 {
-        let older = app.samples.front().unwrap();
-        let newer = app.samples.back().unwrap();
-        let seconds = newer.0.saturating_duration_since(older.0).as_secs_f64().max(0.2);
-        (newer.1.saturating_sub(older.1) as f64) / seconds
-    } else {
-        0.0
-    };
+    let speed = app.rate.rate().unwrap_or(0.0);
     // Whole run, waits included, so it agrees with Time left.
     let run = app.sample_start.elapsed().as_secs_f64().max(0.25);
     let items = app.finished as f64 / run;
