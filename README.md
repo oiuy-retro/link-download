@@ -25,7 +25,7 @@ Wizard pages: Options, Links, Names, Titles, Metadata, Download.
 
 Windows 10 or later.
 
-Tested with yt-dlp `2026.10.10.233141`, FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), and Node `v24.16.0`.
+Tested with yt-dlp `2026.10.10.233141`, FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), and Node `v26.12.1`.
 
 ## Build
 

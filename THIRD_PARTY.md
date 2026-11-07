@@ -2,7 +2,7 @@
 
 Link Download links against or is meant to run next to the following projects. This repository has the Link Download sources; the built exe is on the [latest release](https://github.com/oiuy-retro/link-download/releases/latest). Neither includes yt-dlp, FFmpeg, or Node.js.
 
-Tested with yt-dlp `2026.10.10.233141`, FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), and Node `v24.16.0`.
+Tested with yt-dlp `2026.10.10.233141`, FFmpeg `2026-09-10-git-fd7c73d01e-full_build` (Gyan), and Node `v26.12.1`.
 
 ## Rust crates (linked into the exe)
 
@@ -19,7 +19,7 @@ Tested with yt-dlp `2026.10.10.233141`, FFmpeg `2026-09-10-git-fd7c73d01e-full_b
 | --- | --- | --- |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | Download, playlist dump, SponsorBlock cuts, metadata. Tested with `2026.10.10.233141`. |
 | [FFmpeg](https://ffmpeg.org/) | LGPL / GPL, depending on the build | Remux, transcode, covers. A Gyan full build is GPL-3.0. Tested with `ffmpeg version 2026-09-10-git-fd7c73d01e-full_build` from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/). |
-| [Node.js](https://nodejs.org/) | MIT | yt-dlp runs YouTube player JS with `node.exe`. Tested with `v24.16.0`. |
+| [Node.js](https://nodejs.org/) | MIT | yt-dlp runs YouTube player JS with `node.exe`. Tested with `v26.12.1`. |
 
 FFmpeg is a trademark of Fabrice Bellard / the FFmpeg project. Node.js is a trademark of the OpenJS Foundation.
 
