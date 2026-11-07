@@ -81,41 +81,79 @@ pub struct Job {
     pub left: u32,
     /// The active item's download still needs this long at the smoothed speed.
     pub download: Option<f64>,
-    /// The active item is converting, and this much of the usual convert time is left.
+    /// Set while the active item is converting. The seconds are ignored.
+    /// Time left does not add convert time.
     pub convert_left: Option<f64>,
     /// The pause before the next item is running and has this long to go.
     pub waiting: Option<f64>,
-    /// Average convert time of the items that have converted so far.
+    /// Average convert time so far, in seconds. Not used: adding it made Time left jump.
+    #[allow(dead_code)]
     pub convert_avg: Option<f64>,
     /// Average download size of the items that have downloaded so far, in bytes.
     pub bytes_per_item: Option<f64>,
     /// Smoothed download speed, bytes per second.
     pub speed: Option<f64>,
-    /// Average pause the app inserts before each next item (the middle of min..max).
+    /// Middle of the shortest and longest pause. Used when `waits_left` is absent.
     pub wait: f64,
+    /// Bytes still to download for the items that are left, when their sizes are known.
+    pub bytes_left: Option<f64>,
+    /// Pauses still to run after the current one, in seconds. Rolled once at the start.
+    pub waits_left: Option<f64>,
+}
+
+/// Bytes still to download. Each pair is `(size, copied)`. A size of 0 is unknown
+/// and uses the average of the known sizes. None when nothing has a size.
+pub fn bytes_remaining(items: &[(u64, u64)]) -> Option<f64> {
+    let known: Vec<u64> = items.iter().map(|(size, _)| *size).filter(|size| *size > 0).collect();
+    if known.is_empty() {
+        return None;
+    }
+    let average = known.iter().copied().sum::<u64>() as f64 / known.len() as f64;
+    let total = items
+        .iter()
+        .map(|(size, copied)| {
+            let size = if *size > 0 { *size as f64 } else { average };
+            (size - (*copied as f64).min(size)).max(0.0)
+        })
+        .sum();
+    Some(total)
 }
 
 /// Seconds left for the whole run. None means there is not enough to go on yet.
 ///
-/// The current item: its download left at the smoothed speed plus the usual convert
-/// time, or what is left of its convert, or of the pause before it. Each item after it:
-/// the pause, then the average download size at the smoothed speed plus the usual
-/// convert time. Before anything has downloaded, sizes are unknown, so the per-item
-/// time is the plain average of finished items (pauses included), or for the very
-/// first item, how long it has taken so far plus its download left.
+/// When `bytes_left` is known, the download time is those bytes at the smoothed
+/// speed, plus the pauses that have not started. Convert time is left out: it
+/// made Time left jump when each file finished. Otherwise each later item uses
+/// the average size so far (or, before any size is known, how long finished
+/// items took).
 pub fn time_left(job: &Job) -> Option<f64> {
     if job.left == 0 {
         return Some(0.0);
     }
+    if job.bytes_left.is_some() && job.speed.filter(|speed| speed.is_finite() && *speed > 0.0).is_some() {
+        return time_left_from_sizes(job);
+    }
+    time_left_from_history(job)
+}
+
+fn time_left_from_sizes(job: &Job) -> Option<f64> {
+    let ok = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0);
+    let speed = ok(job.speed).filter(|speed| *speed > 0.0)?;
+    let bytes = ok(job.bytes_left)?;
+    let future_waits = ok(job.waits_left).unwrap_or(job.left.saturating_sub(1) as f64 * job.wait.max(0.0));
+    let pause_now = ok(job.waiting).unwrap_or(0.0);
+    Some(bytes / speed + pause_now + future_waits)
+}
+
+fn time_left_from_history(job: &Job) -> Option<f64> {
     let ok = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0);
     let wait = job.wait.max(0.0);
-    let convert = ok(job.convert_avg).unwrap_or(0.0);
     let speed = ok(job.speed).filter(|s| *s > 0.0);
     let download = ok(job.download);
     let avg_per = if job.finished > 0 { Some(job.last_finish.max(0.0) / job.finished as f64) } else { None };
-    // One item's time without the pause before it.
+    // One item's download, without the pause before it. Convert time is not included.
     let mut item = match (ok(job.bytes_per_item), speed) {
-        (Some(bytes), Some(speed)) => Some(bytes / speed + convert),
+        (Some(bytes), Some(speed)) => Some(bytes / speed),
         _ => avg_per.map(|per| (per - wait).max(0.0)),
     };
     if item.is_none() {
@@ -131,15 +169,17 @@ pub fn time_left(job: &Job) -> Option<f64> {
     let current = if let Some(pause) = ok(job.waiting) {
         pause + item
     } else if let Some(download) = download {
-        download + convert
-    } else if let Some(left) = ok(job.convert_left) {
-        left
+        download
+    } else if ok(job.convert_left).is_some() {
+        // This file has finished downloading and is converting. That time is not counted.
+        0.0
     } else if let Some(per) = avg_per {
         (per - since).max(0.0)
     } else {
         item
     };
-    Some(current + (job.left - 1) as f64 * (wait + item))
+    let future_waits = ok(job.waits_left).unwrap_or(job.left.saturating_sub(1) as f64 * wait);
+    Some(current + future_waits + (job.left - 1) as f64 * item)
 }
 
 /// Download speed as an exponentially weighted average with a time constant of `tau`
@@ -255,6 +295,17 @@ impl Countdown {
         }
     }
 
+    /// Keep the shown time still. Converting a file does not change how long the
+    /// downloads still to come will take, so the number must not run down and
+    /// then jump back when the file is done.
+    pub fn hold(&mut self, now: f64) {
+        self.tick_at = now;
+        if let Some(shown) = self.shown {
+            self.target = Some((now, shown));
+        }
+        self.math_at = Some(now);
+    }
+
     /// Move the shown value on to `now`.
     pub fn tick(&mut self, now: f64) {
         let dt = (now - self.tick_at).max(0.0);
@@ -351,26 +402,78 @@ mod tests {
     }
 
     #[test]
-    fn time_left_counts_sizes_convert_and_pauses() {
-        // 10 MB items at 1 MB/s, 4 s to convert, 6 s pause. Active item: 3 s of
-        // download and its 4 s convert. Then two items of pause + 10 s + 4 s.
+    fn time_left_counts_sizes_and_pauses_but_not_convert() {
+        // 10 MB items at 1 MB/s, 6 s pause. The 4 s convert is ignored. Active item
+        // has 3 s of download left, then two items of a 6 s pause and 10 s of download.
         let j = Job {
             elapsed: 50.0, finished: 1, last_finish: 30.0, left: 3, download: Some(3.0),
             convert_avg: Some(4.0), bytes_per_item: Some(10e6), speed: Some(1e6), wait: 6.0,
             ..Job::default()
         };
-        assert_eq!(time_left(&j), Some(7.0 + 2.0 * 20.0));
-        // Converting, 1 s of its usual convert left.
+        assert_eq!(time_left(&j), Some(3.0 + 2.0 * 16.0));
+        // Converting. That time is not counted, so only the two items after it remain.
         let j2 = Job { download: None, convert_left: Some(1.0), ..j };
-        assert_eq!(time_left(&j2), Some(1.0 + 2.0 * 20.0));
+        assert_eq!(time_left(&j2), Some(2.0 * 16.0));
         // In the pause before the next item, 5 s to go: those 5 s, that item, then one more.
         let j3 = Job { download: None, waiting: Some(5.0), left: 2, ..j };
-        assert_eq!(time_left(&j3), Some(5.0 + 14.0 + 20.0));
+        assert_eq!(time_left(&j3), Some(5.0 + 10.0 + 16.0));
     }
 
     #[test]
     fn time_left_is_zero_when_done() {
         assert_eq!(time_left(&job(90.0, 3, 90.0, 0, None, 6.0)), Some(0.0));
+    }
+
+    #[test]
+    fn bytes_remaining_sums_what_is_left_and_fills_unknowns() {
+        // 100 with 40 copied, a full 50, and one unknown. The unknown uses the
+        // average of the known sizes, (100 + 50) / 2.
+        assert_eq!(bytes_remaining(&[(100, 40), (50, 0), (0, 0)]), Some(60.0 + 50.0 + 75.0));
+        assert_eq!(bytes_remaining(&[(0, 0)]), None);
+    }
+
+    #[test]
+    fn time_left_uses_known_sizes_and_known_pauses() {
+        // 30 MB still to get at 1 MB/s, 9 s of pauses queued. The 4 s convert is ignored.
+        let job = Job {
+            elapsed: 20.0,
+            finished: 1,
+            last_finish: 15.0,
+            left: 2,
+            bytes_left: Some(30e6),
+            speed: Some(1e6),
+            convert_avg: Some(4.0),
+            waits_left: Some(9.0),
+            ..Job::default()
+        };
+        assert_eq!(time_left(&job), Some(30.0 + 9.0));
+        // Converting, with 10 MB and a 5 s pause still to come. The convert itself is not counted.
+        let converting = Job {
+            left: 2,
+            bytes_left: Some(10e6),
+            speed: Some(1e6),
+            convert_avg: Some(4.0),
+            convert_left: Some(1.0),
+            waits_left: Some(5.0),
+            ..Job::default()
+        };
+        assert_eq!(time_left(&converting), Some(10.0 + 5.0));
+    }
+
+    #[test]
+    fn time_left_known_pauses_replace_the_midpoint() {
+        // Same run as `time_left_after_one_item_without_sizes` (60 s at a 6 s midpoint),
+        // except the one pause still queued was rolled as 4 s.
+        let job = Job {
+            elapsed: 30.0,
+            finished: 1,
+            last_finish: 30.0,
+            left: 2,
+            wait: 6.0,
+            waits_left: Some(4.0),
+            ..Job::default()
+        };
+        assert_eq!(time_left(&job), Some(58.0));
     }
 
     #[test]
@@ -434,6 +537,15 @@ mod tests {
             out.push(eta.show().unwrap());
         }
         out
+    }
+
+    #[test]
+    fn countdown_holds_still_while_converting() {
+        let mut eta = Countdown::new();
+        eta.sync(0.0, 2, Some(100.0));
+        eta.hold(0.0);
+        eta.hold(30.0);
+        assert!((eta.show().unwrap() - 100.0).abs() < 1e-6);
     }
 
     #[test]

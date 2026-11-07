@@ -2900,7 +2900,10 @@ impl App {
         // The app's own pause between items (see run::countdown). Nothing downloads in
         // it, so it is left out of the speed.
         let waiting = live.rows.iter().find(|row| row.kind == RowKind::Waiting).and_then(|row| readout::waiting_seconds(&row.note));
-        self.rate.push(at, bytes, waiting.is_some());
+        let active_now = live.rows.iter().find(|row| row.kind == RowKind::Active);
+        // Converting adds no bytes, so leave it out of the speed or Time left shoots up.
+        let converting = active_now.is_some_and(|row| row.convert > 0.0);
+        self.rate.push(at, bytes, waiting.is_some() || converting);
         // Items pinned before the run starts count as done but took no time. Leave them out.
         if live.total == 0 {
             return;
@@ -2922,9 +2925,11 @@ impl App {
             }
         }
         self.last_done = done;
+        let mut convert_just_started = false;
         if let Some(row) = active {
             if row.convert > 0.0 && self.converting.map(|(id, _)| id) != Some(row.id) {
                 // Its download just finished. Remember its size for the items after it.
+                convert_just_started = true;
                 self.converting = Some((row.id, at));
                 if row.size > 0 {
                     self.download_bytes = self.download_bytes.saturating_add(row.size);
@@ -2933,16 +2938,19 @@ impl App {
             }
         }
         let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count() as u32;
-        if self.eta.due(at, left) {
+        // Refresh when the schedule says so, and once when a convert starts so the
+        // finished download drops out. After that, hold: syncing every frame would
+        // keep counting the clock down, then the number would jump back.
+        let refresh = self.eta.due(at, left) || convert_just_started;
+        if refresh {
             let speed = self.rate.rate().filter(|speed| *speed > 0.0);
             let convert_avg = (self.convert_count > 0).then(|| self.convert_total / self.convert_count as f64);
             let download = active
                 .filter(|row| row.size > 0 && row.fraction < 1.0 && row.convert == 0.0)
                 .and_then(|row| speed.map(|speed| row.size.saturating_sub(row.copied) as f64 / speed));
-            let convert_left = match (self.converting, convert_avg) {
-                (Some((_, start)), Some(avg)) if active.is_some_and(|row| row.convert > 0.0) => Some((avg - (at - start)).max(0.0)),
-                _ => None,
-            };
+            // Present means "this file is converting." The seconds are not used.
+            let convert_left = converting.then_some(0.0);
+            let downloading = self.busy == Busy::Download;
             let job = readout::Job {
                 elapsed: at,
                 finished: self.finished,
@@ -2954,11 +2962,16 @@ impl App {
                 convert_avg,
                 bytes_per_item: (self.download_count > 0).then(|| self.download_bytes as f64 / self.download_count as f64),
                 speed,
-                // The app waits a random min..max seconds before each next item.
-                wait: if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 },
+                // Used only when the pauses were not rolled ahead of the run.
+                wait: if downloading { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 },
+                bytes_left: downloading.then(|| planned_bytes(live)).flatten(),
+                waits_left: downloading.then(|| live.waits.iter().map(|seconds| *seconds as f64).sum()),
             };
             self.eta.sync(at, left, readout::time_left(&job));
-        } else {
+        }
+        if converting {
+            self.eta.hold(at);
+        } else if !refresh {
             self.eta.tick(at);
         }
     }
@@ -3143,6 +3156,17 @@ fn popup_for(id: i32, code: u16, leaving_for_own_control: bool) -> bool {
         return code == EN_KILLFOCUS as u16 && leaving_for_own_control;
     }
     code != EN_CHANGE as u16 && code != EN_KILLFOCUS as u16
+}
+
+/// Sizes still to download. A row that is converting has already finished its download.
+fn planned_bytes(live: &Live) -> Option<f64> {
+    let items: Vec<(u64, u64)> = live
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Waiting) || (row.kind == RowKind::Active && row.convert == 0.0))
+        .map(|row| (row.size, row.copied))
+        .collect();
+    readout::bytes_remaining(&items)
 }
 
 fn speed_of(app: &App) -> (f64, f64) {
