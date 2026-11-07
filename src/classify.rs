@@ -8,10 +8,14 @@ pub enum Hit {
     Other(String),
 }
 
+/// Shown when no video or audio stream of the link fits the options, even after every fallback codec.
+pub const NO_FORMAT: &str = "No video or audio of this link fits the chosen container. Try MKV, or tick Re-encode.";
+
 pub fn classify(text: &str) -> Hit {
     let lower = text.to_lowercase();
     if lower.contains("requested format is not available") {
-        return Hit::Other(error_line(text));
+        // yt-dlp's own line ends with "Use --list-formats", which means nothing in this program.
+        return Hit::Other(NO_FORMAT.into());
     }
     if lower.contains("http error 429") || lower.contains("http error 402") || lower.contains("too many requests") {
         return Hit::RateLimit;
@@ -88,7 +92,7 @@ mod tests {
         );
         assert_eq!(classify("ERROR: [youtube] abc: Video unavailable"), Hit::Missing);
         assert_eq!(classify("ERROR: This video has been removed"), Hit::Missing);
-        assert!(matches!(classify("ERROR: requested format is not available"), Hit::Other(_)));
+        assert_eq!(classify("ERROR: [youtube] x: Requested format is not available. Use --list-formats for a list of available formats"), Hit::Other(NO_FORMAT.into()));
     }
 
     #[test]

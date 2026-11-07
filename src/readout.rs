@@ -51,6 +51,8 @@ pub fn format_items(per_second: f64) -> String {
     }
 }
 
+/// Time left with a unit on every field: 12D:05H:05M:04S. Leading units that are
+/// zero are left out (01H:05M:04S, 05M:04S), but minutes and seconds always show.
 pub fn format_eta(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "Calculating...".into();
@@ -61,40 +63,280 @@ pub fn format_eta(seconds: f64) -> String {
     let minutes = (total % 3_600) / 60;
     let secs = total % 60;
     if days > 0 {
-        format!("{days:02}:{hours:02}:{minutes:02}:{secs:02}")
+        format!("{days:02}D:{hours:02}H:{minutes:02}M:{secs:02}S")
     } else if hours > 0 {
-        format!("{hours:02}:{minutes:02}:{secs:02}")
+        format!("{hours:02}H:{minutes:02}M:{secs:02}S")
     } else {
-        format!("{minutes:02}:{secs:02}")
+        format!("{minutes:02}M:{secs:02}S")
     }
 }
 
-/// Seconds left, from the whole run so far. `elapsed` is seconds since the run started,
-/// `last_finish` is when the latest of the `finished` items ended, `progress` is how far
-/// the active item is (0 to 1), and `wait` is the average pause between items.
-/// None means there is not enough to go on yet.
-pub fn time_left(elapsed: f64, finished: u32, last_finish: f64, left: u32, progress: Option<f64>, wait: f64) -> Option<f64> {
-    if left == 0 {
+/// What Time left is worked out from. All times are seconds.
+#[derive(Clone, Copy, Default)]
+pub struct Job {
+    /// Since the run started.
+    pub elapsed: f64,
+    /// Items finished so far, and when the latest of them ended.
+    pub finished: u32,
+    pub last_finish: f64,
+    /// Items not finished yet, the active or waiting one included.
+    pub left: u32,
+    /// The active item's download still needs this long at the smoothed speed.
+    pub download: Option<f64>,
+    /// Set while the active item is converting. The seconds are ignored.
+    /// Time left does not add convert time.
+    pub convert_left: Option<f64>,
+    /// The pause before the next item is running and has this long to go.
+    pub waiting: Option<f64>,
+    /// Average convert time so far, in seconds. Not used: adding it made Time left jump.
+    #[allow(dead_code)]
+    pub convert_avg: Option<f64>,
+    /// Average download size of the items that have downloaded so far, in bytes.
+    pub bytes_per_item: Option<f64>,
+    /// Smoothed download speed, bytes per second.
+    pub speed: Option<f64>,
+    /// Middle of the shortest and longest pause. Used when `waits_left` is absent.
+    pub wait: f64,
+    /// Bytes still to download for the items that are left, when their sizes are known.
+    pub bytes_left: Option<f64>,
+    /// Pauses still to run after the current one, in seconds. Rolled once at the start.
+    pub waits_left: Option<f64>,
+}
+
+/// Bytes still to download. Each pair is `(size, copied)`. A size of 0 is unknown
+/// and uses the average of the known sizes. None when nothing has a size.
+pub fn bytes_remaining(items: &[(u64, u64)]) -> Option<f64> {
+    let known: Vec<u64> = items.iter().map(|(size, _)| *size).filter(|size| *size > 0).collect();
+    if known.is_empty() {
+        return None;
+    }
+    let average = known.iter().copied().sum::<u64>() as f64 / known.len() as f64;
+    let total = items
+        .iter()
+        .map(|(size, copied)| {
+            let size = if *size > 0 { *size as f64 } else { average };
+            (size - (*copied as f64).min(size)).max(0.0)
+        })
+        .sum();
+    Some(total)
+}
+
+/// Seconds left for the whole run. None means there is not enough to go on yet.
+///
+/// When `bytes_left` is known, the download time is those bytes at the smoothed
+/// speed, plus the pauses that have not started. Convert time is left out: it
+/// made Time left jump when each file finished. Otherwise each later item uses
+/// the average size so far (or, before any size is known, how long finished
+/// items took).
+pub fn time_left(job: &Job) -> Option<f64> {
+    if job.left == 0 {
         return Some(0.0);
     }
-    let progress = progress.filter(|p| p.is_finite()).unwrap_or(0.0).clamp(0.0, 1.0);
-    let rest = (left - 1) as f64;
-    if finished == 0 {
-        // Early guess from the first item alone, once it is far enough along to trust.
-        if progress < 0.2 || elapsed < 3.0 {
+    if job.bytes_left.is_some() && job.speed.filter(|speed| speed.is_finite() && *speed > 0.0).is_some() {
+        return time_left_from_sizes(job);
+    }
+    time_left_from_history(job)
+}
+
+fn time_left_from_sizes(job: &Job) -> Option<f64> {
+    let ok = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0);
+    let speed = ok(job.speed).filter(|speed| *speed > 0.0)?;
+    let bytes = ok(job.bytes_left)?;
+    let future_waits = ok(job.waits_left).unwrap_or(job.left.saturating_sub(1) as f64 * job.wait.max(0.0));
+    let pause_now = ok(job.waiting).unwrap_or(0.0);
+    Some(bytes / speed + pause_now + future_waits)
+}
+
+fn time_left_from_history(job: &Job) -> Option<f64> {
+    let ok = |v: Option<f64>| v.filter(|x| x.is_finite() && *x >= 0.0);
+    let wait = job.wait.max(0.0);
+    let speed = ok(job.speed).filter(|s| *s > 0.0);
+    let download = ok(job.download);
+    let avg_per = if job.finished > 0 { Some(job.last_finish.max(0.0) / job.finished as f64) } else { None };
+    // One item's download, without the pause before it. Convert time is not included.
+    let mut item = match (ok(job.bytes_per_item), speed) {
+        (Some(bytes), Some(speed)) => Some(bytes / speed),
+        _ => avg_per.map(|per| (per - wait).max(0.0)),
+    };
+    if item.is_none() {
+        // First item: what it took so far plus what its download still needs.
+        let download = download?;
+        if job.elapsed < 3.0 {
             return None;
         }
-        let per = elapsed / progress;
-        return Some(per * (1.0 - progress) + (per + wait.max(0.0)) * rest);
+        item = Some(job.elapsed + download);
     }
-    // Each item has taken this long on average, pauses included.
-    let per = last_finish.max(0.0) / finished as f64;
-    let since = (elapsed - last_finish).max(0.0);
-    // Count down from the last finish. If this item runs long, fall back to its own progress
-    // (the pause before it is already over, so only the download part is left).
-    let floor = if progress > 0.0 { (per - wait).max(0.0) * (1.0 - progress) } else { 0.0 };
-    let current = (per - since).max(floor);
-    Some(current + per * rest)
+    let item = item?;
+    let since = (job.elapsed - job.last_finish).max(0.0);
+    let current = if let Some(pause) = ok(job.waiting) {
+        pause + item
+    } else if let Some(download) = download {
+        download
+    } else if ok(job.convert_left).is_some() {
+        // This file has finished downloading and is converting. That time is not counted.
+        0.0
+    } else if let Some(per) = avg_per {
+        (per - since).max(0.0)
+    } else {
+        item
+    };
+    let future_waits = ok(job.waits_left).unwrap_or(job.left.saturating_sub(1) as f64 * wait);
+    Some(current + future_waits + (job.left - 1) as f64 * item)
+}
+
+/// Download speed as an exponentially weighted average with a time constant of `tau`
+/// seconds, weighted by the real time between samples. Older samples fade out
+/// gradually, so a slow patch does not drop out of the average all at once.
+pub struct SmoothRate {
+    tau: f64,
+    rate: Option<f64>,
+    last: Option<(f64, u64)>,
+    warm: Option<(f64, u64)>,
+}
+
+impl SmoothRate {
+    pub fn new(tau: f64) -> Self {
+        Self { tau, rate: None, last: None, warm: None }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::new(self.tau);
+    }
+
+    /// `paused`: the app is in its pause between items. Nothing downloads then, so the
+    /// time is left out instead of pulling the speed toward zero.
+    pub fn push(&mut self, at: f64, bytes: u64, paused: bool) {
+        if paused {
+            self.last = None;
+            self.warm = None;
+            return;
+        }
+        let Some((last_at, last_bytes)) = self.last else {
+            self.last = Some((at, bytes));
+            self.warm = Some((at, bytes));
+            return;
+        };
+        if bytes < last_bytes {
+            // The total went down (a failed item's bytes were dropped). Measure from here.
+            self.last = Some((at, bytes));
+            self.warm = Some((at, bytes));
+            return;
+        }
+        let dt = at - last_at;
+        if dt <= 0.0 {
+            return;
+        }
+        self.last = Some((at, bytes));
+        match self.rate {
+            None => {
+                // The first value is a plain average over at least a second.
+                if let Some((warm_at, warm_bytes)) = self.warm {
+                    if at - warm_at >= 1.0 {
+                        self.rate = Some(bytes.saturating_sub(warm_bytes) as f64 / (at - warm_at));
+                    }
+                }
+            }
+            Some(rate) => {
+                let now = (bytes - last_bytes) as f64 / dt;
+                let alpha = 1.0 - (-dt / self.tau).exp();
+                self.rate = Some(rate + alpha * (now - rate));
+            }
+        }
+    }
+
+    pub fn rate(&self) -> Option<f64> {
+        self.rate
+    }
+}
+
+/// Time left as shown. The estimate is worked out every `EVERY` seconds. In between the
+/// shown value counts down by the clock, and it eases toward the newest estimate rather
+/// than jumping: each tick closes part of the gap. When the estimate grew, the shown
+/// value only counts down more slowly; it never counts up. It jumps straight to the
+/// estimate the first time, when an item finishes, and when the gap is over half.
+pub struct Countdown {
+    shown: Option<f64>,
+    target: Option<(f64, f64)>,
+    tick_at: f64,
+    math_at: Option<f64>,
+    left: u32,
+}
+
+impl Countdown {
+    pub const EVERY: f64 = 5.0;
+    /// Seconds for most of a gap to close.
+    pub const EASE: f64 = 3.0;
+
+    pub fn new() -> Self {
+        Self { shown: None, target: None, tick_at: 0.0, math_at: None, left: 0 }
+    }
+
+    pub fn due(&self, now: f64, left: u32) -> bool {
+        match self.math_at {
+            None => true,
+            Some(at) => now - at >= Self::EVERY || left != self.left,
+        }
+    }
+
+    /// New math. None (not enough to go on) keeps counting down what is shown.
+    pub fn sync(&mut self, now: f64, left: u32, estimate: Option<f64>) {
+        self.tick(now);
+        let item_done = self.math_at.is_some() && left != self.left;
+        self.math_at = Some(now);
+        self.left = left;
+        let Some(estimate) = estimate.filter(|s| s.is_finite() && *s >= 0.0) else {
+            return;
+        };
+        self.target = Some((now, estimate));
+        let snap = match self.shown {
+            None => true,
+            Some(shown) => item_done || (estimate - shown).abs() > 0.5 * shown.max(1.0),
+        };
+        if snap {
+            self.shown = Some(estimate);
+        }
+    }
+
+    /// Keep the shown time still. Converting a file does not change how long the
+    /// downloads still to come will take, so the number must not run down and
+    /// then jump back when the file is done.
+    pub fn hold(&mut self, now: f64) {
+        self.tick_at = now;
+        if let Some(shown) = self.shown {
+            self.target = Some((now, shown));
+        }
+        self.math_at = Some(now);
+    }
+
+    /// Move the shown value on to `now`.
+    pub fn tick(&mut self, now: f64) {
+        let dt = (now - self.tick_at).max(0.0);
+        self.tick_at = now;
+        let (Some(shown), Some((at, value))) = (self.shown, self.target) else {
+            return;
+        };
+        let target = (value - (now - at)).max(0.0);
+        let mut next = shown - dt;
+        let gap = target - next;
+        let mut step = gap * (1.0 - (-dt / Self::EASE).exp());
+        if step > 0.0 {
+            // Slow the countdown down, but keep it going down.
+            step = step.min(dt * 0.9);
+        }
+        next += step;
+        self.shown = Some(next.max(0.0));
+    }
+
+    pub fn show(&self) -> Option<f64> {
+        self.shown
+    }
+}
+
+/// "Waiting 12 seconds" from the pause between items, as 12.
+pub fn waiting_seconds(note: &str) -> Option<f64> {
+    let rest = note.strip_prefix("Waiting ")?;
+    let number = rest.split_whitespace().next()?;
+    number.parse::<u32>().ok().map(f64::from)
 }
 
 pub fn format_elapsed(seconds: u64) -> String {
@@ -127,49 +369,251 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.50 KB");
         assert_eq!(format_rate(2048.0), "2.00 KB/s");
         assert_eq!(format_items(1.2), "1.20");
-        assert_eq!(format_eta(2.0), "00:02");
-        assert_eq!(format_eta(90.0), "01:30");
-        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0), "05:10:00");
-        assert_eq!(format_eta(86_400.0 + 5.0 * 3600.0 + 10.0 * 60.0), "01:05:10:00");
         assert_eq!(format_elapsed(75), "1:15");
         assert_eq!(format_elapsed(3661), "1:01:01");
         assert_eq!(percent(0.999), 99);
         assert_eq!(percent(1.0), 100);
     }
 
+    fn job(elapsed: f64, finished: u32, last_finish: f64, left: u32, download: Option<f64>, wait: f64) -> Job {
+        Job { elapsed, finished, last_finish, left, download, wait, ..Job::default() }
+    }
+
+    #[test]
+    fn time_left_shows_units() {
+        assert_eq!(format_eta(0.0), "00M:00S");
+        assert_eq!(format_eta(2.0), "00M:02S");
+        assert_eq!(format_eta(90.0), "01M:30S");
+        assert_eq!(format_eta(59.6), "01M:00S");
+        assert_eq!(format_eta(3599.0), "59M:59S");
+        assert_eq!(format_eta(3600.0), "01H:00M:00S");
+        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0), "05H:10M:00S");
+        assert_eq!(format_eta(86_400.0), "01D:00H:00M:00S");
+        assert_eq!(format_eta(12.0 * 86_400.0 + 5.0 * 3600.0 + 5.0 * 60.0 + 4.0), "12D:05H:05M:04S");
+        assert_eq!(format_eta(120.0 * 86_400.0), "120D:00H:00M:00S");
+        assert_eq!(format_eta(-1.0), "Calculating...");
+        assert_eq!(format_eta(f64::NAN), "Calculating...");
+    }
+
     #[test]
     fn time_left_waits_for_something_to_go_on() {
-        assert_eq!(time_left(0.0, 0, 0.0, 3, None, 6.0), None);
-        assert_eq!(time_left(10.0, 0, 0.0, 3, Some(0.1), 6.0), None);
-        assert_eq!(time_left(1.0, 0, 0.0, 3, Some(0.5), 6.0), None);
+        assert_eq!(time_left(&job(0.0, 0, 0.0, 3, None, 6.0)), None);
+        assert_eq!(time_left(&job(10.0, 0, 0.0, 3, None, 6.0)), None);
+        assert_eq!(time_left(&job(1.0, 0, 0.0, 3, Some(10.0), 6.0)), None);
     }
 
     #[test]
     fn time_left_guesses_from_the_first_item() {
-        // Half done after 10 s: 10 s more for it, then 20 s plus a 6 s pause for each of the 2 after it.
-        assert_eq!(time_left(10.0, 0, 0.0, 3, Some(0.5), 6.0), Some(10.0 + 26.0 * 2.0));
+        // 10 s in, 10 s of download left: 10 s more, then a 6 s pause and 20 s for each of 2.
+        assert_eq!(time_left(&job(10.0, 0, 0.0, 3, Some(10.0), 6.0)), Some(10.0 + 26.0 * 2.0));
     }
 
     #[test]
-    fn time_left_after_one_item() {
-        // One item took 30 s. Two left, nothing started yet.
-        assert_eq!(time_left(30.0, 1, 30.0, 2, None, 6.0), Some(60.0));
-        // Ten seconds later it has counted down by ten.
-        assert_eq!(time_left(40.0, 1, 30.0, 2, Some(0.0), 6.0), Some(50.0));
+    fn time_left_after_one_item_without_sizes() {
+        // One item took 30 s, pause included. Two left, nothing downloading yet.
+        assert_eq!(time_left(&job(30.0, 1, 30.0, 2, None, 6.0)), Some(60.0));
+        assert_eq!(time_left(&job(40.0, 1, 30.0, 2, None, 6.0)), Some(50.0));
     }
 
     #[test]
-    fn time_left_uses_the_active_item_when_it_runs_long() {
-        // 50 s into an item that usually takes 30 s (6 s of it the pause), and 80% done:
-        // a fifth of 24 s for it, then 30 s for the last one.
-        let left = time_left(80.0, 1, 30.0, 2, Some(0.8), 6.0).unwrap();
-        assert!((left - 34.8).abs() < 1e-9);
-        // Still on schedule: the countdown wins.
-        assert_eq!(time_left(40.0, 1, 30.0, 2, Some(0.5), 6.0), Some(50.0));
+    fn time_left_counts_sizes_and_pauses_but_not_convert() {
+        // 10 MB items at 1 MB/s, 6 s pause. The 4 s convert is ignored. Active item
+        // has 3 s of download left, then two items of a 6 s pause and 10 s of download.
+        let j = Job {
+            elapsed: 50.0, finished: 1, last_finish: 30.0, left: 3, download: Some(3.0),
+            convert_avg: Some(4.0), bytes_per_item: Some(10e6), speed: Some(1e6), wait: 6.0,
+            ..Job::default()
+        };
+        assert_eq!(time_left(&j), Some(3.0 + 2.0 * 16.0));
+        // Converting. That time is not counted, so only the two items after it remain.
+        let j2 = Job { download: None, convert_left: Some(1.0), ..j };
+        assert_eq!(time_left(&j2), Some(2.0 * 16.0));
+        // In the pause before the next item, 5 s to go: those 5 s, that item, then one more.
+        let j3 = Job { download: None, waiting: Some(5.0), left: 2, ..j };
+        assert_eq!(time_left(&j3), Some(5.0 + 10.0 + 16.0));
     }
 
     #[test]
     fn time_left_is_zero_when_done() {
-        assert_eq!(time_left(90.0, 3, 90.0, 0, None, 6.0), Some(0.0));
+        assert_eq!(time_left(&job(90.0, 3, 90.0, 0, None, 6.0)), Some(0.0));
+    }
+
+    #[test]
+    fn bytes_remaining_sums_what_is_left_and_fills_unknowns() {
+        // 100 with 40 copied, a full 50, and one unknown. The unknown uses the
+        // average of the known sizes, (100 + 50) / 2.
+        assert_eq!(bytes_remaining(&[(100, 40), (50, 0), (0, 0)]), Some(60.0 + 50.0 + 75.0));
+        assert_eq!(bytes_remaining(&[(0, 0)]), None);
+    }
+
+    #[test]
+    fn time_left_uses_known_sizes_and_known_pauses() {
+        // 30 MB still to get at 1 MB/s, 9 s of pauses queued. The 4 s convert is ignored.
+        let job = Job {
+            elapsed: 20.0,
+            finished: 1,
+            last_finish: 15.0,
+            left: 2,
+            bytes_left: Some(30e6),
+            speed: Some(1e6),
+            convert_avg: Some(4.0),
+            waits_left: Some(9.0),
+            ..Job::default()
+        };
+        assert_eq!(time_left(&job), Some(30.0 + 9.0));
+        // Converting, with 10 MB and a 5 s pause still to come. The convert itself is not counted.
+        let converting = Job {
+            left: 2,
+            bytes_left: Some(10e6),
+            speed: Some(1e6),
+            convert_avg: Some(4.0),
+            convert_left: Some(1.0),
+            waits_left: Some(5.0),
+            ..Job::default()
+        };
+        assert_eq!(time_left(&converting), Some(10.0 + 5.0));
+    }
+
+    #[test]
+    fn time_left_known_pauses_replace_the_midpoint() {
+        // Same run as `time_left_after_one_item_without_sizes` (60 s at a 6 s midpoint),
+        // except the one pause still queued was rolled as 4 s.
+        let job = Job {
+            elapsed: 30.0,
+            finished: 1,
+            last_finish: 30.0,
+            left: 2,
+            wait: 6.0,
+            waits_left: Some(4.0),
+            ..Job::default()
+        };
+        assert_eq!(time_left(&job), Some(58.0));
+    }
+
+    #[test]
+    fn smooth_rate_starts_with_a_plain_average_then_fades_gradually() {
+        let mut rate = SmoothRate::new(5.0);
+        rate.push(0.0, 0, false);
+        rate.push(0.5, 500, false);
+        assert_eq!(rate.rate(), None);
+        rate.push(1.0, 1_000, false);
+        assert_eq!(rate.rate(), Some(1_000.0));
+        // The speed drops to zero: the average falls a little each second, not all at once.
+        let mut seen = vec![];
+        for t in 2..=6 {
+            rate.push(t as f64, 1_000, false);
+            seen.push(rate.rate().unwrap());
+        }
+        assert!(seen.windows(2).all(|w| w[1] < w[0]));
+        // After one time constant (5 s) about e^-1 of it is left.
+        assert!((seen[4] - 1_000.0 * (-1.0f64).exp()).abs() < 1.0, "{seen:?}");
+    }
+
+    #[test]
+    fn smooth_rate_weights_by_real_time() {
+        // Ten 0.1 s samples move it as much as one 1 s sample.
+        let mut a = SmoothRate::new(5.0);
+        let mut b = SmoothRate::new(5.0);
+        for r in [&mut a, &mut b] {
+            r.push(0.0, 0, false);
+            r.push(1.0, 1_000, false);
+        }
+        a.push(2.0, 4_000, false);
+        for step in 1..=10 {
+            b.push(1.0 + step as f64 * 0.1, 1_000 + step * 300, false);
+        }
+        assert!((a.rate().unwrap() - b.rate().unwrap()).abs() < 5.0);
+    }
+
+    #[test]
+    fn smooth_rate_leaves_out_the_pause() {
+        let mut rate = SmoothRate::new(5.0);
+        rate.push(0.0, 0, false);
+        rate.push(2.0, 2_000, false);
+        for t in 3..=20 {
+            rate.push(t as f64, 2_000, true);
+        }
+        assert_eq!(rate.rate(), Some(1_000.0));
+        rate.push(21.0, 2_000, false);
+        rate.push(22.0, 3_000, false);
+        assert_eq!(rate.rate(), Some(1_000.0));
+        // A drop in the total starts measuring again without losing the speed.
+        rate.push(23.0, 10, false);
+        assert_eq!(rate.rate(), Some(1_000.0));
+    }
+
+    fn tick_through(eta: &mut Countdown, from: f64, to: f64) -> Vec<f64> {
+        let mut out = vec![];
+        let mut t = from;
+        while t < to - 1e-9 {
+            t += 0.1;
+            eta.tick(t);
+            out.push(eta.show().unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn countdown_holds_still_while_converting() {
+        let mut eta = Countdown::new();
+        eta.sync(0.0, 2, Some(100.0));
+        eta.hold(0.0);
+        eta.hold(30.0);
+        assert!((eta.show().unwrap() - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn countdown_ticks_and_eases_down() {
+        let mut eta = Countdown::new();
+        assert_eq!(eta.show(), None);
+        assert!(eta.due(0.0, 3));
+        eta.sync(0.0, 3, Some(100.0));
+        eta.tick(1.0);
+        assert!((eta.show().unwrap() - 99.0).abs() < 1e-9);
+        // New math says 90 at 5 s, where the countdown says 95: no jump, it closes the gap.
+        tick_through(&mut eta, 1.0, 5.0);
+        assert!(eta.due(5.0, 3));
+        eta.sync(5.0, 3, Some(90.0));
+        assert!((eta.show().unwrap() - 95.0).abs() < 1e-6);
+        let seen = tick_through(&mut eta, 5.0, 15.0);
+        // Always going down, faster than the clock at first, landing on the estimate.
+        assert!(seen.windows(2).all(|w| w[1] < w[0]));
+        assert!(seen[9] < 95.0 - 1.0 - 0.5);
+        assert!((seen.last().unwrap() - 80.0).abs() < 0.3, "{}", seen.last().unwrap());
+    }
+
+    #[test]
+    fn countdown_never_counts_up_when_the_estimate_grows() {
+        let mut eta = Countdown::new();
+        eta.sync(0.0, 3, Some(100.0));
+        tick_through(&mut eta, 0.0, 5.0);
+        eta.sync(5.0, 3, Some(120.0));
+        let seen = tick_through(&mut eta, 5.0, 25.0);
+        assert!(seen.windows(2).all(|w| w[1] < w[0]));
+        // It slowed down: after 20 s it is well above 95 - 20.
+        assert!(*seen.last().unwrap() > 85.0, "{}", seen.last().unwrap());
+    }
+
+    #[test]
+    fn countdown_jumps_on_a_huge_gap_or_an_item_finishing() {
+        let mut eta = Countdown::new();
+        eta.sync(0.0, 3, Some(100.0));
+        eta.sync(5.0, 3, Some(300.0));
+        assert_eq!(eta.show(), Some(300.0));
+        assert!(eta.due(5.5, 2));
+        eta.sync(5.5, 2, Some(250.0));
+        assert_eq!(eta.show(), Some(250.0));
+        // No estimate: keeps counting down.
+        eta.sync(6.0, 2, None);
+        assert!((eta.show().unwrap() - 249.5).abs() < 1e-6);
+        eta.tick(10_000.0);
+        assert_eq!(eta.show(), Some(0.0));
+    }
+
+    #[test]
+    fn reads_the_pause_countdown() {
+        assert_eq!(waiting_seconds("Waiting 12 seconds"), Some(12.0));
+        assert_eq!(waiting_seconds("Waiting 1 seconds"), Some(1.0));
+        assert_eq!(waiting_seconds("Unavailable"), None);
     }
 }
