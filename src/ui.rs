@@ -1643,7 +1643,7 @@ impl App {
     }
 
     fn static_text(&mut self, x: i32, y: i32, w: i32, h: i32, text: &str, prefix_off: bool) -> HWND {
-        let bits = if prefix_off { 0x800 } else { 0 };
+        let bits = if prefix_off { 0x80 } else { 0 }; // SS_NOPREFIX
         self.make(self.host, "Static", text, 0x40000000 | 0x10000000 | bits, 0, x, y, w, h, 0, 0)
     }
 
@@ -4230,19 +4230,18 @@ fn focus_next(shift: bool) {
         let Some(app) = borrow.as_ref() else {
             return;
         };
-        let mut stops = Vec::new();
-        unsafe {
-            let mut child_hwnd = neighbor(app.pane(), GW_CHILD);
-            while !child_hwnd.0.is_null() {
-                let style = GetWindowLongPtrW(child_hwnd, GWL_STYLE) as u32;
-                if style & 0x00010000 != 0 && IsWindowVisible(child_hwnd).0 != 0 && IsWindowEnabled(child_hwnd).0 != 0 {
-                    stops.push(child_hwnd);
-                }
-                child_hwnd = neighbor(child_hwnd, GW_HWNDNEXT);
-            }
-        }
-        // GetWindow walks top-to-bottom z-order, which is reverse creation. Flip it.
-        stops.reverse();
+        // Creation order is tab order. GetWindow already walks children in creation order, so the
+        // old reverse of that list sent Tab backwards.
+        let stops: Vec<HWND> = app
+            .kids
+            .iter()
+            .map(|kid| kid.hwnd)
+            .filter(|hwnd| {
+                let style = unsafe { GetWindowLongPtrW(*hwnd, GWL_STYLE) as u32 };
+                style & 0x00010000 != 0 && enabled_visible(*hwnd)
+            })
+            .collect();
+        let mut stops = stops;
         if unsafe { IsWindowEnabled(app.back).0 != 0 } {
             stops.push(app.back);
         }
@@ -4312,66 +4311,129 @@ fn activate_default() -> bool {
     true
 }
 
+/// What a control is, as far as Alt+letter is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MnemonicKind {
+    /// A push button: Alt+letter clicks it.
+    Push,
+    /// A check box or radio button: Alt+letter focuses it and clicks it, which toggles or selects it.
+    Toggle,
+    /// A static label: Alt+letter focuses the next control that takes Tab.
+    Label,
+    /// Anything else (edit, combo box, list). Never named by its own text.
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MnemonicSlot {
+    kind: MnemonicKind,
+    letter: Option<char>,
+    /// Enabled and visible. A disabled or hidden control never fires and is never a label's target.
+    live: bool,
+    tab_stop: bool,
+}
+
+/// Picks the control that Alt+`ch` should act on, given the controls in creation (tab) order.
+/// Returns the index of the control to act on. A label resolves to the next live tab stop after
+/// it. When several controls share a letter, the first one after `focus` wins, so pressing the
+/// shortcut again moves on to the next one, the way Windows dialogs do.
+fn pick_mnemonic(slots: &[MnemonicSlot], ch: char, focus: Option<usize>) -> Option<usize> {
+    let ch = ch.to_ascii_uppercase();
+    let mut hits = Vec::new();
+    for (index, slot) in slots.iter().enumerate() {
+        if slot.letter != Some(ch) || !slot.live {
+            continue;
+        }
+        let target = match slot.kind {
+            MnemonicKind::Push | MnemonicKind::Toggle => Some(index),
+            MnemonicKind::Label => slots.iter().enumerate().skip(index + 1).find(|(_, next)| next.tab_stop && next.live).map(|(i, _)| i),
+            MnemonicKind::Other => None,
+        };
+        if let Some(target) = target {
+            if !hits.contains(&target) {
+                hits.push(target);
+            }
+        }
+    }
+    let start = focus.unwrap_or(usize::MAX);
+    hits.iter().copied().find(|hit| focus.is_some() && *hit > start).or_else(|| hits.first().copied())
+}
+
+fn mnemonic_kind(hwnd: HWND) -> MnemonicKind {
+    let class = class_name(hwnd);
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 };
+    if class.eq_ignore_ascii_case("Button") {
+        match style & 0xF {
+            // BS_CHECKBOX, BS_AUTOCHECKBOX, BS_RADIOBUTTON, BS_3STATE, BS_AUTO3STATE, BS_AUTORADIOBUTTON
+            2 | 3 | 4 | 5 | 6 | 9 => MnemonicKind::Toggle,
+            // BS_GROUPBOX: acts like a label for the control after it.
+            7 => MnemonicKind::Label,
+            _ => MnemonicKind::Push,
+        }
+    } else if class.eq_ignore_ascii_case("Static") {
+        // SS_NOPREFIX shows the & as text, so it is not a shortcut.
+        if style & 0x80 != 0 { MnemonicKind::Other } else { MnemonicKind::Label }
+    } else {
+        MnemonicKind::Other
+    }
+}
+
 fn activate_mnemonic(ch: char) -> bool {
-    let targets = APP.with(|slot| {
+    // Creation order is tab order. Page controls first, then Back and Next.
+    let order = APP.with(|slot| {
         let borrow = slot.borrow();
         let Some(app) = borrow.as_ref() else {
             return Vec::new();
         };
-        let mut found = Vec::new();
-        collect_mnemonics(app.pane(), ch, &mut found);
-        collect_mnemonics(app.hwnd, ch, &mut found);
-        found
+        let mut order: Vec<HWND> = app.kids.iter().map(|kid| kid.hwnd).collect();
+        order.push(app.back);
+        order.push(app.next);
+        order
     });
-    let Some(target) = targets.into_iter().find(|hwnd| unsafe { IsWindowEnabled(*hwnd).0 != 0 && IsWindowVisible(*hwnd).0 != 0 }) else {
+    let order: Vec<HWND> = order.into_iter().filter(|hwnd| !hwnd.0.is_null()).collect();
+    let slots: Vec<MnemonicSlot> = order
+        .iter()
+        .map(|hwnd| {
+            let kind = mnemonic_kind(*hwnd);
+            let style = unsafe { GetWindowLongPtrW(*hwnd, GWL_STYLE) as u32 };
+            MnemonicSlot {
+                kind,
+                letter: if kind == MnemonicKind::Other { None } else { accel_char(&get_text(*hwnd)) },
+                live: enabled_visible(*hwnd),
+                tab_stop: style & 0x00010000 != 0,
+            }
+        })
+        .collect();
+    let focus = unsafe { GetFocus() };
+    // Focus may sit inside a control (the edit inside a combo box), so match its parent too.
+    let parent = unsafe { GetParent(focus).unwrap_or(HWND(std::ptr::null_mut())) };
+    let at = order.iter().position(|hwnd| *hwnd == focus || *hwnd == parent);
+    let Some(index) = pick_mnemonic(&slots, ch, at) else {
         return false;
     };
-    let class = class_name(target);
-    unsafe { let _ = SetFocus(target); }
-    if class == "Button" {
-        unsafe { SendMessageW(target, 0x00F5, WPARAM(0), LPARAM(0)); }
-    }
-    true
-}
-
-fn collect_mnemonics(parent: HWND, ch: char, out: &mut Vec<HWND>) {
+    let target = order[index];
     unsafe {
-        let mut child_hwnd = neighbor(parent, GW_CHILD);
-        while !child_hwnd.0.is_null() {
-            let text = get_text(child_hwnd);
-            if accel_char(&text) == Some(ch) {
-                let class = class_name(child_hwnd);
-                if class == "Static" {
-                    // The next tab stop is the control this label names. Creation order was reversed.
-                } else {
-                    out.push(child_hwnd);
-                }
+        match slots[index].kind {
+            MnemonicKind::Push => {
+                // The click may rebuild the page, so nothing touches the button afterwards.
+                SendMessageW(target, 0x00F5, WPARAM(0), LPARAM(0));
+                return true;
             }
-            child_hwnd = neighbor(child_hwnd, GW_HWNDNEXT);
-        }
-    }
-    if out.is_empty() {
-        // Static label: focus the following tab stop, searched in creation order.
-        let mut stops = Vec::new();
-        unsafe {
-            let mut child_hwnd = neighbor(parent, GW_CHILD);
-            while !child_hwnd.0.is_null() {
-                stops.push(child_hwnd);
-                child_hwnd = neighbor(child_hwnd, GW_HWNDNEXT);
+            MnemonicKind::Toggle => {
+                let _ = SetFocus(target);
+                SendMessageW(target, 0x00F5, WPARAM(0), LPARAM(0));
             }
-        }
-        stops.reverse();
-        for (index, hwnd) in stops.iter().enumerate() {
-            if accel_char(&get_text(*hwnd)) == Some(ch) && class_name(*hwnd) == "Static" {
-                if let Some(next) = stops.iter().skip(index + 1).find(|candidate| {
-                    let style = unsafe { GetWindowLongPtrW(**candidate, GWL_STYLE) as u32 };
-                    style & 0x00010000 != 0
-                }) {
-                    out.push(*next);
+            _ => {
+                let _ = SetFocus(target);
+                if class_name(target).eq_ignore_ascii_case("Edit") {
+                    // Like a dialog: jumping to a text box selects what is in it.
+                    SendMessageW(target, 0x00B1, WPARAM(0), LPARAM(-1));
                 }
             }
         }
     }
+    reveal_window(target);
+    true
 }
 
 fn enable(hwnd: HWND, value: bool) {
@@ -4383,10 +4445,15 @@ fn neighbor(hwnd: HWND, cmd: windows::Win32::UI::WindowsAndMessaging::GET_WINDOW
 }
 
 fn accel_char(text: &str) -> Option<char> {
-    let chars: Vec<char> = text.chars().collect();
-    for (index, ch) in chars.iter().enumerate() {
-        if *ch == '&' && index + 1 < chars.len() && chars[index + 1] != '&' {
-            return Some(chars[index + 1].to_ascii_uppercase());
+    // "&&" is a literal ampersand. The first single "&" marks the shortcut letter.
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '&' {
+            match chars.next() {
+                Some('&') => continue,
+                Some(letter) if !letter.is_whitespace() => return Some(letter.to_ascii_uppercase()),
+                _ => return None,
+            }
         }
     }
     None
@@ -4595,6 +4662,62 @@ fn font_bits(font: HFONT) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot(kind: MnemonicKind, letter: Option<char>, live: bool, tab_stop: bool) -> MnemonicSlot {
+        MnemonicSlot { kind, letter, live, tab_stop }
+    }
+
+    #[test]
+    fn mnemonic_button_and_checkbox_pick_themselves() {
+        let slots = [
+            slot(MnemonicKind::Push, Some('S'), true, true),
+            slot(MnemonicKind::Toggle, Some('Y'), true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 's', None), Some(0));
+        assert_eq!(pick_mnemonic(&slots, 'y', None), Some(1));
+        assert_eq!(pick_mnemonic(&slots, 'q', None), None);
+    }
+
+    #[test]
+    fn mnemonic_label_focuses_next_live_tab_stop() {
+        let slots = [
+            slot(MnemonicKind::Label, Some('N'), true, false),
+            slot(MnemonicKind::Other, None, false, true),
+            slot(MnemonicKind::Label, None, true, false),
+            slot(MnemonicKind::Other, None, true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 'n', None), Some(3));
+    }
+
+    #[test]
+    fn mnemonic_skips_disabled_and_hidden() {
+        let slots = [
+            slot(MnemonicKind::Toggle, Some('E'), false, true),
+            slot(MnemonicKind::Push, Some('E'), true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 'e', None), Some(1));
+        let none = [slot(MnemonicKind::Push, Some('E'), false, true)];
+        assert_eq!(pick_mnemonic(&none, 'e', None), None);
+    }
+
+    #[test]
+    fn mnemonic_repeats_cycle_through_clashes() {
+        let slots = [
+            slot(MnemonicKind::Push, Some('R'), true, true),
+            slot(MnemonicKind::Other, None, true, true),
+            slot(MnemonicKind::Push, Some('R'), true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 'r', None), Some(0));
+        assert_eq!(pick_mnemonic(&slots, 'r', Some(0)), Some(2));
+        assert_eq!(pick_mnemonic(&slots, 'r', Some(2)), Some(0));
+    }
+
+    #[test]
+    fn accel_char_reads_the_marked_letter() {
+        assert_eq!(accel_char("Audio onl&y"), Some('Y'));
+        assert_eq!(accel_char("Rock && Roll"), None);
+        assert_eq!(accel_char("Tom && &Jerry"), Some('J'));
+    }
 
     #[test]
     fn a_mouse_notch_moves_a_whole_step() {
