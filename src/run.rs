@@ -101,10 +101,11 @@ struct RunOut {
 }
 
 pub fn fetch(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg_dir: PathBuf, urls: Vec<String>) {
+    let node_dir = crate::tools::node_dir(&node);
     reset(&shared);
     let mut groups = Vec::new();
     set_status(&shared, "Updating yt-dlp…");
-    match run_command(&shared, &ytdlp, &commands::update_args(&node, &ffmpeg_dir), Some(&ffmpeg_dir), false, |_| {}) {
+    match run_command(&shared, &ytdlp, &commands::update_args(&node, &ffmpeg_dir), Some(&node_dir), false, |_| {}) {
         Ok(output) if output.code != 0 => {
             shared.live.lock().expect("live").error = "yt-dlp did not update. Using the current copy.".into();
         }
@@ -127,7 +128,7 @@ pub fn fetch(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg_dir: Pat
             live.total = urls.len() as u32;
             live.ok = index as u32;
         }
-        match run_command(&shared, &ytdlp, &commands::dump_args(&node, &ffmpeg_dir, url), Some(&ffmpeg_dir), true, |_| {}) {
+        match run_command(&shared, &ytdlp, &commands::dump_args(&node, &ffmpeg_dir, url), Some(&node_dir), true, |_| {}) {
             Ok(output) => groups.push(group_from_dump(url, &output)),
             Err(err) => groups.push(error_group(url, &err)),
         }
@@ -137,6 +138,7 @@ pub fn fetch(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg_dir: Pat
 }
 
 pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: PathBuf, ffmpeg_dir: PathBuf, opts: Options, mut groups: Vec<Group>) {
+    let node_dir = crate::tools::node_dir(&node);
     reset(&shared);
     // The Location box already makes the folder a full path. This is a second
     // guard: ffmpeg runs from the output folder, so a relative folder would be
@@ -262,7 +264,7 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 let shared_progress = shared.clone();
                 // Fresh for each attempt, so a retry counts from the start again.
                 let mut tracker = commands::ItemProgress::default();
-                let result = run_command(&shared, &ytdlp, &args, Some(&ffmpeg_dir), false, move |line| {
+                let result = run_command(&shared, &ytdlp, &args, Some(&node_dir), false, move |line| {
                     if let Some(bytes) = commands::parse_expected_bytes(line) {
                         tracker.expect(bytes);
                         return;
@@ -932,7 +934,9 @@ fn collect_sizes(
     }
     let owned: Vec<String> = urls.iter().map(|url| (*url).to_string()).collect();
     let args = commands::size_args(opts, &owned, playlist_items, node, ffmpeg_dir);
-    match run_command(shared, ytdlp, &args, Some(ffmpeg_dir), true, |_| {}) {
+    // Same folder as the download: yt-dlp resolves `node:<file name>` from its working directory.
+    let node_dir = crate::tools::node_dir(node);
+    match run_command(shared, ytdlp, &args, Some(&node_dir), true, |_| {}) {
         Ok(output) => {
             for line in output.stdout.lines() {
                 if let Some((id, bytes)) = commands::parse_size_line(line) {
