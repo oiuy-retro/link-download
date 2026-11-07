@@ -689,7 +689,9 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let hdc = BeginPaint(hwnd, &mut ps);
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
-            let _ = FillRect(hdc, &rect, FACE.get());
+            // The empty part of a per-item bar is the white row showing through. `chunks`
+            // does not paint that part, so this bar has to start white or the track is gray.
+            let _ = FillRect(hdc, &rect, white_brush());
             let pos = GetWindowLongPtrW(hwnd, GWLP_USERDATA).clamp(0, 1000);
             chunks(hdc, rect, pos as f64 / 1000.0);
             let _ = EndPaint(hwnd, &ps);
