@@ -1,7 +1,6 @@
 //! Windows 98 wizard. Classic controls, MS Sans Serif, no visual styles.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -13,9 +12,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreateRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, GetDC,
-    GetDeviceCaps, GetMonitorInfoW, GetSysColor, InflateRect, InvalidateRect, MapWindowPoints, MonitorFromWindow,
+    GetDeviceCaps, GetMonitorInfoW, GetSysColor, InflateRect, IntersectClipRect, InvalidateRect, MapWindowPoints, MonitorFromWindow,
     ScreenToClient,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow, ReleaseDC, SelectObject, SetBkColor,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow, ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBkColor,
     SetBkMode, SetTextColor, UpdateWindow, BF_RECT, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_WINDOW,
     COLOR_WINDOWTEXT, EDGE_ETCHED, EDGE_RAISED, EDGE_SUNKEN, HBRUSH, HDC, HFONT, HRGN, LOGPIXELSX,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, SetWindowRgn, SRCCOPY, TRANSPARENT, DT_END_ELLIPSIS, DT_LEFT,
@@ -49,9 +48,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx, GetClientRect,
     GetAncestor, GetClassNameW, GetCursorPos, GetScrollInfo, GA_ROOT, GetDlgItem, GetMessageW, GetParent, GetSystemMetrics, GetWindow,
     PostMessageW, WM_APP, IsChild, IsWindow,
-    GetWindowLongPtrW, GetWindowRect, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadImageW,
+    GetWindowLongPtrW, GetWindowRect, HideCaret, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadImageW,
     MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, BM_GETCHECK, BM_SETCHECK,
+    SetWindowPos, SetWindowTextW, ShowCaret, ShowWindow, TranslateMessage, WindowFromPoint, BM_GETCHECK, BM_SETCHECK,
     CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, DI_NORMAL, EN_CHANGE, EN_KILLFOCUS, GW_CHILD, GW_HWNDNEXT, GWL_STYLE,
     GWLP_ID, GWLP_USERDATA, HMENU, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
@@ -59,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     NCCALCSIZE_PARAMS, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SM_CXFRAME, SM_CXPADDEDBORDER,
     SM_CXSCREEN, SM_CYFRAME, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_CHAR, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_CHAR, WM_GETTEXT, WM_GETTEXTLENGTH, WM_HSCROLL, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NOTIFY, WM_PAINT, WM_SETFONT, WM_SIZE,
     WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPED,
     WS_SYSMENU, WS_THICKFRAME,
@@ -103,6 +102,7 @@ const ID_STATUS: i32 = 50;
 const ID_PROGRESS: i32 = 51;
 const ID_PERCENT: i32 = 53;
 const ID_READOUT: i32 = 60;
+const ID_START_OVER: i32 = 70;
 const ID_REMOVE: i32 = 1000;
 const ID_INSERT: i32 = 2000;
 const ID_MODE: i32 = 3000;
@@ -115,6 +115,7 @@ const ID_ARTIST: i32 = 9000;
 const ID_RESET: i32 = 16000;
 const ID_META_RESET: i32 = 17000;
 const ID_NAME_ERROR: i32 = 18000;
+const ID_FIX_NAMES: i32 = 19000;
 const ID_TITLE_SAME_ALL: i32 = 21000;
 const ID_TITLE_FIELD: i32 = 22000;
 const ID_TITLE_SAME: i32 = 43000;
@@ -137,10 +138,9 @@ thread_local! {
     // Wheel movement smaller than one step, kept for the next message. Touchpads send small deltas.
     static PAGE_WHEEL_REST: Cell<i32> = const { Cell::new(0) };
     static WORK_WHEEL_REST: Cell<i32> = const { Cell::new(0) };
-    // Bold fonts for the characters that make a file name illegal: 12 pt, then 10 pt and
-    // 8 pt for rows too short for it.
-    static MARK_BIG: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
-    static MARK_SMALL: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
+    /// Inside `thicken_name_editor`, so the messages it sends do not thicken again.
+    static THICKENING_NAME: Cell<bool> = const { Cell::new(false) };
+    /// 8 pt bold, the same size as the list. A larger face spills past the editor.
     static MARK_TINY: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
 }
 
@@ -305,7 +305,15 @@ struct App {
     rows: Vec<WorkRow>,
     list_hwnd: HWND,
     list_scroll: i32,
-    samples: VecDeque<(Instant, u64)>,
+    /// Download speed, smoothed over about five seconds. Speed and Time left both use it.
+    rate: readout::SmoothRate,
+    eta: readout::Countdown,
+    /// The active item that is converting, and when its convert started.
+    converting: Option<(u64, f64)>,
+    convert_total: f64,
+    convert_count: u32,
+    download_bytes: u64,
+    download_count: u32,
     sample_start: Instant,
     last_done: u32,
     base_done: Option<u32>,
@@ -392,8 +400,6 @@ pub fn run() -> i32 {
         APP.with(|slot| *slot.borrow_mut() = Some(App::boot(instance)));
         APP.with(|slot| {
             if let Some(app) = slot.borrow().as_ref() {
-                MARK_BIG.set(app.title_font);
-                MARK_SMALL.set(make_font(10, app.dpi, true));
                 MARK_TINY.set(make_font(8, app.dpi, true));
             }
         });
@@ -457,6 +463,16 @@ fn register_classes(instance: HINSTANCE, face: HBRUSH) {
         let _ = RegisterClassW(&main);
         let _ = RegisterClassW(&host);
         let _ = RegisterClassW(&list);
+        let bar = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(bar_proc),
+            hInstance: instance,
+            hCursor: cursor,
+            hbrBackground: face,
+            lpszClassName: w!("LinkProgressBar"),
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&bar);
         let _ = small;
     }
 }
@@ -664,6 +680,40 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             LRESULT(0)
         }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The overall progress bar. The stock progress control fills with the system highlight
+/// color, which is light blue on Windows 10 and 11 (and a visual style can repaint it
+/// any color), so it never matched the navy blocks of the per-item bars. This one draws
+/// the same blocks with `chunks`. It takes PBM_SETPOS with a position out of 1000.
+unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            // The empty part of a per-item bar is the white row showing through. `chunks`
+            // does not paint that part, so this bar has to start white or the track is gray.
+            let _ = FillRect(hdc, &rect, white_brush());
+            let pos = GetWindowLongPtrW(hwnd, GWLP_USERDATA).clamp(0, 1000);
+            chunks(hdc, rect, pos as f64 / 1000.0);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        PBM_SETPOS => {
+            let pos = (wparam.0 as isize).clamp(0, 1000);
+            let old = SetWindowLongPtrW(hwnd, GWLP_USERDATA, pos);
+            if old != pos {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(old)
+        }
+        // The range is always 0 to 1000.
+        PBM_SETRANGE32 => LRESULT(0),
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -890,7 +940,13 @@ impl App {
             rows: Vec::new(),
             list_hwnd: null,
             list_scroll: 0,
-            samples: VecDeque::new(),
+            rate: readout::SmoothRate::new(5.0),
+            eta: readout::Countdown::new(),
+            converting: None,
+            convert_total: 0.0,
+            convert_count: 0,
+            download_bytes: 0,
+            download_count: 0,
             sample_start: Instant::now(),
             last_done: 0,
             base_done: None,
@@ -1410,6 +1466,9 @@ impl App {
             let url = self.groups[group_index].source_url.clone();
             let error = self.groups[group_index].error.clone();
             let titles: Vec<String> = self.groups[group_index].items.iter().map(|item| item.title.clone()).collect();
+            if group_index > 0 {
+                y = self.group_divider(y, w);
+            }
             y = self.url_line(y, w, &url);
             if !error.is_empty() {
                 self.static_text(self.s(8), y, w - self.s(16), self.s(32), &error, true);
@@ -1421,11 +1480,20 @@ impl App {
             let list_h = self.s(20) + rows * self.s(18) + self.s(4);
             let list = self.listview(self.s(8), y, w - self.s(16), list_h, ID_LIST + group_index as i32);
             fill_titles(list, &titles, w - self.s(24));
+            // The guess above uses fixed pixel sizes. The real header and rows can be taller,
+            // which hid the last name under a scroll bar. Grow the list to what it needs.
+            let list_h = list_h.max(list_fit_height(list, rows));
+            self.resize_kid(list, w - self.s(16), list_h);
             y += list_h + self.s(4);
             // SS_OWNERDRAW, so the characters that make the name illegal can be drawn in bold.
-            let error = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x000D, 0, self.s(8), y, w - self.s(16), self.s(32), 0, 0);
+            let fix_w = self.s(150);
+            let error = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x000D, 0, self.s(8), y, w - self.s(24) - fix_w, self.s(32), 0, 0);
             set_id(error, ID_NAME_ERROR + group_index as i32);
+            self.set_anchor(error, Anchor::StretchX);
             show_name_error(error, &self.groups[group_index].items);
+            let fix = self.button(w - self.s(8) - fix_w, y, fix_w, "&Delete Invalid Characters", ID_FIX_NAMES + group_index as i32, false);
+            self.set_anchor(fix, Anchor::Right);
+            set_enabled(fix, paths::names_fixable(&self.groups[group_index].items));
             y += self.s(36);
         }
         y
@@ -1584,7 +1652,7 @@ impl App {
         self.list_hwnd = self.make(self.host, "LinkWorkList", "", 0x40000000 | 0x10000000 | 0x10000, 0x200, self.s(8), y, w - self.s(16), list_h, 52, 0);
         self.set_fill(self.list_hwnd, self.s(78));
         y += list_h + self.s(8);
-        self.progress_hwnd = self.make(self.host, "msctls_progress32", "", 0x40000000 | 0x10000000, 0, self.s(8), y, w - self.s(70), self.s(16), ID_PROGRESS, 0);
+        self.progress_hwnd = self.make(self.host, "LinkProgressBar", "", 0x40000000 | 0x10000000, 0, self.s(8), y, w - self.s(70), self.s(16), ID_PROGRESS, 0);
         self.set_anchor(self.progress_hwnd, Anchor::StretchX);
         unsafe { SendMessageW(self.progress_hwnd, PBM_SETRANGE32, WPARAM(0), LPARAM(1000)); }
         self.percent_hwnd = self.static_text(w - self.s(58), y, self.s(50), self.s(16), "0%", false);
@@ -1597,17 +1665,23 @@ impl App {
             let row = (index / 3) as i32;
             let lx = self.s(8) + col * col_w;
             let ly = y + row * self.s(18);
-            // Time left and Elapsed need room for 01:05:10:00 / Calculating...
+            // Time left and Elapsed need room for 01D:05H:10M:00S / Calculating...
             let timer = index == 3 || index == 4;
             let label_w = if timer {
                 self.s(72)
             } else {
                 (col_w - self.s(72)).clamp(self.s(96), self.s(150))
             };
-            let value_w = (col_w - label_w - self.s(6)).max(if timer { self.s(88) } else { self.s(48) });
+            let value_w = (col_w - label_w - self.s(6)).max(if timer { self.s(100) } else { self.s(48) });
             self.static_text(lx, ly, label_w, self.s(16), label, false);
             self.readout[index] = self.static_text(lx + label_w, ly, value_w, self.s(16), "—", false);
             set_id(self.readout[index], ID_READOUT + index as i32);
+        }
+        if offer_start_over(self.download_done, self.busy == Busy::Idle) {
+            // In the empty third column of the second row of readouts.
+            let bw = self.s(75);
+            let button = self.button(w - self.s(8) - bw, y + self.s(18), bw, "&Start over", ID_START_OVER, false);
+            self.set_anchor(button, Anchor::Right);
         }
         y + self.s(40)
     }
@@ -1617,9 +1691,19 @@ impl App {
         let y = self.s(12);
         self.status_hwnd = self.static_text(self.s(8), y, w - self.s(16), self.s(18), text, false);
         let bar_y = y + self.s(24);
-        self.progress_hwnd = self.make(self.host, "msctls_progress32", "", 0x40000000 | 0x10000000, 0, self.s(8), bar_y, w - self.s(16), self.s(16), ID_PROGRESS, 0);
+        self.progress_hwnd = self.make(self.host, "LinkProgressBar", "", 0x40000000 | 0x10000000, 0, self.s(8), bar_y, w - self.s(16), self.s(16), ID_PROGRESS, 0);
         unsafe { SendMessageW(self.progress_hwnd, PBM_SETRANGE32, WPARAM(0), LPARAM(1000)); }
         bar_y + self.s(24)
+    }
+
+    /// An etched line between two links, so each link reads as the heading of the
+    /// box, list, and warning under it, not as a line under the link before.
+    fn group_divider(&mut self, y: i32, w: i32) -> i32 {
+        let y = y + self.s(4);
+        // SS_ETCHEDHORZ
+        let line = self.make(self.host, "Static", "", 0x40000000 | 0x10000000 | 0x10, 0, self.s(8), y, w - self.s(16), 2, 0, 0);
+        self.set_anchor(line, Anchor::StretchX);
+        y + self.s(10)
     }
 
     fn url_line(&mut self, y: i32, w: i32, url: &str) -> i32 {
@@ -1643,7 +1727,7 @@ impl App {
     }
 
     fn static_text(&mut self, x: i32, y: i32, w: i32, h: i32, text: &str, prefix_off: bool) -> HWND {
-        let bits = if prefix_off { 0x800 } else { 0 };
+        let bits = if prefix_off { 0x80 } else { 0 }; // SS_NOPREFIX
         self.make(self.host, "Static", text, 0x40000000 | 0x10000000 | bits, 0, x, y, w, h, 0, 0)
     }
 
@@ -1767,6 +1851,21 @@ impl App {
         }
     }
 
+    /// Changes a page control's size after it was made, keeping its layout record in step.
+    fn resize_kid(&mut self, hwnd: HWND, w: i32, h: i32) {
+        let view_h = self.view_h().max(1);
+        if let Some(kid) = self.kids.iter_mut().rev().find(|kid| kid.hwnd == hwnd) {
+            if kid.h == h && kid.w == w {
+                return;
+            }
+            kid.w = w;
+            kid.h = h;
+            let in_view = kid.y >= 0 && kid.y + h <= view_h + 2;
+            kid.bottom = if in_view { view_h - (kid.y + h) } else { 0 };
+            unsafe { let _ = MoveWindow(hwnd, kid.x, kid.y, w, h, false); }
+        }
+    }
+
     fn set_fill(&mut self, hwnd: HWND, bottom: i32) {
         if let Some(kid) = self.kids.iter_mut().rev().find(|kid| kid.hwnd == hwnd) {
             kid.anchor = Anchor::Fill;
@@ -1809,7 +1908,12 @@ impl App {
             unsafe { let _ = MoveWindow(kid.hwnd, x, y, w, h, false); }
             let class = class_name(kid.hwnd);
             if class == "SysListView32" {
-                unsafe { SendMessageW(kid.hwnd, 0x101E, WPARAM(0), LPARAM((w - 8).max(40) as isize)); }
+                // LVM_SETCOLUMNWIDTH. Fit the column to the inside of the list, so a guessed
+                // width can never be wider than the list and add a sideways scroll bar.
+                let mut inner = RECT::default();
+                unsafe { let _ = GetClientRect(kid.hwnd, &mut inner); }
+                let room = if inner.right > 0 { inner.right - 2 } else { w - 8 };
+                unsafe { SendMessageW(kid.hwnd, 0x101E, WPARAM(0), LPARAM(room.max(40) as isize)); }
             }
             if class == "ComboBox" {
                 self.clip_closed_combo(kid.hwnd);
@@ -1973,6 +2077,9 @@ impl App {
             if let Ok(label) = child(self.pane(), ID_NAME_ERROR + index as i32) {
                 show_name_error(label, &group.items);
             }
+            if let Ok(fix) = child(self.pane(), ID_FIX_NAMES + index as i32) {
+                set_enabled(fix, paths::names_fixable(&group.items));
+            }
         }
     }
 
@@ -2058,6 +2165,10 @@ impl App {
         if id == ID_BROWSE && code == 0 {
             return Action::Browse;
         }
+        if id == ID_START_OVER && code == 0 {
+            self.start_over();
+            return Action::None;
+        }
         if id == ID_PROFILE && code == CBN_SELCHANGE as u16 {
             self.change_profile();
             return Action::None;
@@ -2104,6 +2215,10 @@ impl App {
         }
         if code == 0 && (ID_META_RESET..ID_NAME_ERROR).contains(&id) {
             self.reset_meta((id - ID_META_RESET) as usize);
+            return Action::None;
+        }
+        if code == 0 && self.page == 2 && (ID_FIX_NAMES..ID_FIX_NAMES + GROUP_LIMIT as i32).contains(&id) {
+            self.fix_names((id - ID_FIX_NAMES) as usize);
             return Action::None;
         }
         if code == 0 && (ID_TITLE_SAME_ALL..ID_TITLE_FIELD).contains(&id) {
@@ -2209,6 +2324,25 @@ impl App {
             }
         }
         Action::None
+    }
+
+    /// Start over, once a download run has finished: back to the first page as if the
+    /// program had just opened. The options and the pasted links are kept. The links
+    /// are looked up again, because nothing from the finished run is reused.
+    fn start_over(&mut self) {
+        if self.busy != Busy::Idle {
+            return;
+        }
+        self.download_done = false;
+        self.fetch_ok = false;
+        self.fetched_text.clear();
+        self.have_media = false;
+        self.groups.clear();
+        self.rows.clear();
+        self.started = None;
+        self.reset_speed();
+        self.page = 0;
+        self.rebuild();
     }
 
     fn go_back(&mut self) -> Action {
@@ -2677,6 +2811,34 @@ impl App {
         }
     }
 
+    /// Delete Invalid Characters: every name in this list that the warning line flags is cleaned with
+    /// `paths::fix_name`. Legal names and blocked videos are left alone.
+    fn fix_names(&mut self, group: usize) {
+        let Ok(list) = child(self.pane(), ID_LIST + group as i32) else {
+            return;
+        };
+        let Some(source) = self.groups.get_mut(group) else {
+            return;
+        };
+        for (index, item) in source.items.iter_mut().enumerate() {
+            if item.blocked.is_some() || paths::filename_problem(&item.title).is_none() {
+                continue;
+            }
+            let next = paths::fix_name(&item.title, &item.original_title);
+            if next != item.title {
+                set_list_text(list, index as i32, &next);
+                item.title = next;
+            }
+        }
+        unsafe { let _ = InvalidateRect(list, None, true); }
+        let focus = unsafe { GetFocus() };
+        self.refresh_nav();
+        // The button greys out once nothing is left to fix. Keep the keyboard on the list then.
+        if !focus.0.is_null() && unsafe { IsWindowEnabled(focus).0 } == 0 {
+            unsafe { let _ = SetFocus(list); }
+        }
+    }
+
     fn reset_names(&mut self, group: usize) {
         let Some(source) = self.groups.get_mut(group) else {
             return;
@@ -2791,7 +2953,13 @@ impl App {
     }
 
     fn reset_speed(&mut self) {
-        self.samples.clear();
+        self.rate.clear();
+        self.eta = readout::Countdown::new();
+        self.converting = None;
+        self.convert_total = 0.0;
+        self.convert_count = 0;
+        self.download_bytes = 0;
+        self.download_count = 0;
         self.sample_start = Instant::now();
         self.last_done = 0;
         self.base_done = None;
@@ -2866,6 +3034,10 @@ impl App {
                 self.download_done = true;
                 self.have_media = true;
                 self.media_stamp = self.options.clone();
+                // Puts Start over on the page, then fills the status line, bar,
+                // and readouts back in.
+                self.rebuild();
+                self.paint_readouts(&live);
                 self.refresh_nav();
                 unsafe { let _ = InvalidateRect(self.list_hwnd, None, false); }
             }
@@ -2877,21 +3049,84 @@ impl App {
     fn track_speed(&mut self, live: &Live) {
         let now = Instant::now();
         let bytes = live.banked_bytes.saturating_add(live.current_bytes);
-        self.samples.push_back((now, bytes));
-        while self.samples.len() > 2 && now.saturating_duration_since(self.samples[0].0).as_millis() > 2000 {
-            self.samples.pop_front();
-        }
+        let at = now.saturating_duration_since(self.sample_start).as_secs_f64();
+        // The app's own pause between items (see run::countdown). Nothing downloads in
+        // it, so it is left out of the speed.
+        let waiting = live.rows.iter().find(|row| row.kind == RowKind::Waiting).and_then(|row| readout::waiting_seconds(&row.note));
+        let active_now = live.rows.iter().find(|row| row.kind == RowKind::Active);
+        // Converting adds no bytes, so leave it out of the speed or Time left shoots up.
+        let converting = active_now.is_some_and(|row| row.convert > 0.0);
+        self.rate.push(at, bytes, waiting.is_some() || converting);
         // Items pinned before the run starts count as done but took no time. Leave them out.
         if live.total == 0 {
             return;
         }
         let done = live.ok.saturating_add(live.bad);
         let base = *self.base_done.get_or_insert(done);
+        let active = live.rows.iter().find(|row| row.kind == RowKind::Active);
         if done > self.last_done.max(base) {
             self.finished = done - base;
-            self.last_finish = now.saturating_duration_since(self.sample_start).as_secs_f64();
+            self.last_finish = at;
+            // The item that was converting is done: count how long its convert took.
+            if let Some((id, start)) = self.converting.take() {
+                if active.map(|row| row.id) != Some(id) {
+                    self.convert_total += at - start;
+                    self.convert_count += 1;
+                } else {
+                    self.converting = Some((id, start));
+                }
+            }
         }
         self.last_done = done;
+        let mut convert_just_started = false;
+        if let Some(row) = active {
+            if row.convert > 0.0 && self.converting.map(|(id, _)| id) != Some(row.id) {
+                // Its download just finished. Remember its size for the items after it.
+                convert_just_started = true;
+                self.converting = Some((row.id, at));
+                if row.size > 0 {
+                    self.download_bytes = self.download_bytes.saturating_add(row.size);
+                    self.download_count += 1;
+                }
+            }
+        }
+        let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count() as u32;
+        // Refresh when the schedule says so, and once when a convert starts so the
+        // finished download drops out. After that, hold: syncing every frame would
+        // keep counting the clock down, then the number would jump back.
+        let refresh = self.eta.due(at, left) || convert_just_started;
+        if refresh {
+            let speed = self.rate.rate().filter(|speed| *speed > 0.0);
+            let convert_avg = (self.convert_count > 0).then(|| self.convert_total / self.convert_count as f64);
+            let download = active
+                .filter(|row| row.size > 0 && row.fraction < 1.0 && row.convert == 0.0)
+                .and_then(|row| speed.map(|speed| row.size.saturating_sub(row.copied) as f64 / speed));
+            // Present means "this file is converting." The seconds are not used.
+            let convert_left = converting.then_some(0.0);
+            let downloading = self.busy == Busy::Download;
+            let job = readout::Job {
+                elapsed: at,
+                finished: self.finished,
+                last_finish: self.last_finish,
+                left,
+                download,
+                convert_left,
+                waiting,
+                convert_avg,
+                bytes_per_item: (self.download_count > 0).then(|| self.download_bytes as f64 / self.download_count as f64),
+                speed,
+                // Used only when the pauses were not rolled ahead of the run.
+                wait: if downloading { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 },
+                bytes_left: downloading.then(|| planned_bytes(live)).flatten(),
+                waits_left: downloading.then(|| live.waits.iter().map(|seconds| *seconds as f64).sum()),
+            };
+            self.eta.sync(at, left, readout::time_left(&job));
+        }
+        if converting {
+            self.eta.hold(at);
+        } else if !refresh {
+            self.eta.tick(at);
+        }
     }
 
     fn paint_readouts(&self, live: &Live) {
@@ -2913,9 +3148,8 @@ impl App {
         }
         let (speed, items) = speed_of(self);
         let left = live.rows.iter().filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Active | RowKind::Waiting)).count();
-        let progress = live.rows.iter().find(|row| row.kind == RowKind::Active).map(|row| (row.fraction + row.convert) * 0.5);
-        let wait = if self.busy == Busy::Download { (self.options.min_wait + self.options.max_wait) as f64 * 0.5 } else { 0.0 };
-        let estimate = readout::time_left(self.sample_start.elapsed().as_secs_f64(), self.finished, self.last_finish, left as u32, progress, wait);
+        // Counts down between the five-second updates in `track_speed`, easing toward each new one.
+        let estimate = self.eta.show();
         let eta = if live.done || left == 0 {
             "—".to_string()
         } else if let Some(seconds) = estimate {
@@ -3020,6 +3254,9 @@ impl App {
                 if let Ok(reset) = child(self.pane(), ID_RESET + index as i32) {
                     add_tip(self, reset, "Put the file names back");
                 }
+                if let Ok(fix) = child(self.pane(), ID_FIX_NAMES + index as i32) {
+                    add_tip(self, fix, "Delete the characters Windows does not allow, and the periods and spaces at the end");
+                }
             }
         }
         if self.page == 3 {
@@ -3077,15 +3314,19 @@ fn popup_for(id: i32, code: u16, leaving_for_own_control: bool) -> bool {
     code != EN_CHANGE as u16 && code != EN_KILLFOCUS as u16
 }
 
+/// Sizes still to download. A row that is converting has already finished its download.
+fn planned_bytes(live: &Live) -> Option<f64> {
+    let items: Vec<(u64, u64)> = live
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, RowKind::Queued | RowKind::Waiting) || (row.kind == RowKind::Active && row.convert == 0.0))
+        .map(|row| (row.size, row.copied))
+        .collect();
+    readout::bytes_remaining(&items)
+}
+
 fn speed_of(app: &App) -> (f64, f64) {
-    let speed = if app.samples.len() >= 2 {
-        let older = app.samples.front().unwrap();
-        let newer = app.samples.back().unwrap();
-        let seconds = newer.0.saturating_duration_since(older.0).as_secs_f64().max(0.2);
-        (newer.1.saturating_sub(older.1) as f64) / seconds
-    } else {
-        0.0
-    };
+    let speed = app.rate.rate().unwrap_or(0.0);
     // Whole run, waits included, so it agrees with Time left.
     let run = app.sample_start.elapsed().as_secs_f64().max(0.25);
     let items = app.finished as f64 / run;
@@ -3324,6 +3565,37 @@ fn text_in(hdc: HDC, text: &str, mut rect: RECT, format: windows::Win32::Graphic
     }
 }
 
+/// Window height a report list needs to show its header and `rows` whole rows with no
+/// scroll bar, measured from the list itself so any font or scaling is covered.
+fn list_fit_height(list: HWND, rows: i32) -> i32 {
+    unsafe {
+        let mut outer = RECT::default();
+        let mut inner = RECT::default();
+        let _ = GetWindowRect(list, &mut outer);
+        let _ = GetClientRect(list, &mut inner);
+        let frame = (outer.bottom - outer.top) - (inner.bottom - inner.top);
+        // LVM_GETHEADER
+        let header = HWND(SendMessageW(list, 0x101F, WPARAM(0), LPARAM(0)).0 as *mut _);
+        let mut head = RECT::default();
+        if !header.0.is_null() {
+            let _ = GetWindowRect(header, &mut head);
+        }
+        // LVM_GETITEMRECT with LVIR_BOUNDS for the first row.
+        let mut row = RECT { left: 0, ..Default::default() };
+        let got = SendMessageW(list, 0x100E, WPARAM(0), LPARAM(&mut row as *mut _ as isize)).0 != 0;
+        let row_h = if got { row.bottom - row.top } else { 0 };
+        if row_h <= 0 {
+            return 0;
+        }
+        list_height(frame, head.bottom - head.top, row_h, rows)
+    }
+}
+
+/// Frame, header, and whole rows, plus 2 pixels so the last row never touches the edge.
+fn list_height(frame: i32, header: i32, row: i32, rows: i32) -> i32 {
+    frame.max(0) + header.max(0) + row * rows.max(1) + 2
+}
+
 fn fill_titles(list: HWND, titles: &[String], width: i32) {
     let mut title = wide("File name");
     let column = LVCOLUMNW {
@@ -3387,16 +3659,11 @@ fn draw_name_error(item: &DRAWITEMSTRUCT) {
             SelectObject(hdc, old);
             return;
         }
-        // The name with its marks on the first line, the reason on the second.
+        // The file name on the first line, the reason on the second. A colon glued
+        // on the end of the name was the thin mark after the thick ones.
         let (normal_h, _) = font_height(hdc, normal);
-        let room = (rect.bottom - rect.top - normal_h).max(normal_h);
-        let bold = mark_font(hdc, room);
-        let (bold_h, _) = ink_height(hdc, bold);
-        let first_h = bold_h.max(normal_h);
-        let first = RECT { bottom: rect.top + first_h, ..rect };
-        let mut line = marks;
-        line.push((':', Mark::Plain));
-        draw_marked(hdc, &first, &line, normal, bold, COLORREF(GetSysColor(color)), rgb(192, 192, 192));
+        let first = RECT { bottom: rect.top + normal_h, ..rect };
+        draw_marked(hdc, &first, &marks, normal, mark_bold(normal), COLORREF(GetSysColor(color)), rgb(192, 192, 192));
         let rest: String = chars[name_len..].iter().collect();
         let rest = rest.trim_start_matches(':').trim_start();
         let mut wide: Vec<u16> = rest.encode_utf16().collect();
@@ -3407,24 +3674,78 @@ fn draw_name_error(item: &DRAWITEMSTRUCT) {
     }
 }
 
+/// What one custom-draw stage should do with a Names row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowPaint {
+    /// CDDS_PREPAINT: ask for each row.
+    Ask,
+    /// Let the list paint this stage.
+    Ignore,
+    /// Skip the list's text. It is a second, plain copy of the name.
+    Skip,
+    /// Fill the row and skip its text. The in-place editor is the only copy.
+    Behind,
+    /// Fill the row and draw the marks once.
+    Marks,
+}
+
+/// `stage` is a list-view custom-draw stage. A marked row is painted once.
+/// The subitem pass and the post-paint pass would draw it again, and so would
+/// the row while its editor is open.
+fn name_row_paint(stage: u32, marked: bool, editing: bool) -> RowPaint {
+    const PRE: u32 = 0x0001;
+    const ITEM: u32 = 0x0001_0000;
+    const SUB: u32 = 0x0002_0000;
+    if stage == PRE {
+        return RowPaint::Ask;
+    }
+    if !marked || stage & ITEM == 0 {
+        return RowPaint::Ignore;
+    }
+    if stage & SUB != 0 {
+        return if stage & PRE != 0 { RowPaint::Skip } else { RowPaint::Ignore };
+    }
+    if stage & PRE == 0 {
+        return RowPaint::Ignore;
+    }
+    if editing { RowPaint::Behind } else { RowPaint::Marks }
+}
+
 /// NM_CUSTOMDRAW for a Names list. Rows with a legal name are left to the list.
 /// Rows with marks are drawn here, with the list's own colors for each state.
 fn name_row_draw(lparam: LPARAM) -> isize {
     unsafe {
-        let draw = &*(lparam.0 as *const NMLVCUSTOMDRAW);
+        let draw = &mut *(lparam.0 as *mut NMLVCUSTOMDRAW);
         let stage = draw.nmcd.dwDrawStage.0;
         if stage == 0x0001 {
-            // CDDS_PREPAINT: ask for each row.
             return 0x20;
-        }
-        if stage != 0x0001_0001 {
-            return 0;
         }
         let list = draw.nmcd.hdr.hwndFrom;
         let index = draw.nmcd.dwItemSpec as i32;
         let marks = paths::name_marks(&list_text(list, index));
-        if marks.iter().all(|(_, mark)| *mark == Mark::Plain) {
+        let marked = marks.iter().any(|(_, mark)| *mark != Mark::Plain);
+        // LVM_GETEDITCONTROL. The focused row is the one being typed.
+        let edit = HWND(SendMessageW(list, 0x1018, WPARAM(0), LPARAM(0)).0 as *mut _);
+        let state = SendMessageW(list, 0x102C, WPARAM(index as usize), LPARAM(0x0003)).0 as u32;
+        let editing = !edit.0.is_null() && state & 0x0001 != 0;
+        let paint = name_row_paint(stage, marked, editing);
+        if paint == RowPaint::Ignore {
             return 0;
+        }
+        if paint == RowPaint::Ask {
+            return 0x20;
+        }
+        let selected = state & 0x0002 != 0;
+        let focused = state & 0x0001 != 0;
+        let has_focus = GetFocus() == list;
+        let enabled = IsWindowEnabled(list).0 != 0;
+        let (back, fore) = row_colors(selected, has_focus, enabled);
+        // If the list still paints the label, it would be the same color as the row.
+        let hidden = COLORREF(GetSysColor(back));
+        draw.clrText = hidden;
+        draw.clrTextBk = hidden;
+        if paint == RowPaint::Skip {
+            return 4;
         }
         let hdc = draw.nmcd.hdc;
         // LVM_GETITEMRECT with LVIR_BOUNDS, then LVIR_LABEL.
@@ -3432,31 +3753,32 @@ fn name_row_draw(lparam: LPARAM) -> isize {
         SendMessageW(list, 0x100E, WPARAM(index as usize), LPARAM(&mut bounds as *mut _ as isize));
         let mut label = RECT { left: 2, ..Default::default() };
         SendMessageW(list, 0x100E, WPARAM(index as usize), LPARAM(&mut label as *mut _ as isize));
-        // LVM_GETITEMSTATE for LVIS_FOCUSED | LVIS_SELECTED.
-        let state = SendMessageW(list, 0x102C, WPARAM(index as usize), LPARAM(0x0003)).0 as u32;
-        let selected = state & 0x0002 != 0;
-        let focused = state & 0x0001 != 0;
-        let has_focus = GetFocus() == list;
-        let enabled = IsWindowEnabled(list).0 != 0;
-        let (back, fore) = row_colors(selected, has_focus, enabled);
         let _ = FillRect(hdc, &bounds, GetSysColorBrush(COLOR_WINDOW));
         let row = RECT { left: label.left, ..bounds };
         if back != COLOR_WINDOW {
             let _ = FillRect(hdc, &row, GetSysColorBrush(back));
         }
-        let normal = HFONT(SendMessageW(list, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
-        let old = SelectObject(hdc, normal);
-        let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(GetSysColor(fore)));
-        let bold = mark_font(hdc, bounds.bottom - bounds.top);
-        // The list starts its own text 5 pixels into the label and keeps 5 free at the end.
-        let text = RECT { left: label.left + 5, right: label.right - 5, ..label };
-        draw_marked(hdc, &text, &marks, normal, bold, COLORREF(GetSysColor(fore)), COLORREF(GetSysColor(back)));
-        if focused && has_focus {
+        if paint == RowPaint::Marks {
+            let normal = HFONT(SendMessageW(list, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+            let old = SelectObject(hdc, normal);
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            let _ = SetTextColor(hdc, COLORREF(GetSysColor(fore)));
+            // The list starts its own text 5 pixels into the label and keeps 5 free at the end.
+            let text = RECT { left: label.left + 5, right: label.right - 5, ..label };
+            draw_marked(
+                hdc,
+                &text,
+                &marks,
+                normal,
+                mark_bold(normal),
+                COLORREF(GetSysColor(fore)),
+                COLORREF(GetSysColor(back)),
+            );
+            SelectObject(hdc, old);
+        }
+        if focused && has_focus && !editing {
             let _ = DrawFocusRect(hdc, &row);
         }
-        SelectObject(hdc, old);
-        // CDRF_SKIPDEFAULT
         4
     }
 }
@@ -3482,26 +3804,10 @@ unsafe fn font_height(hdc: HDC, font: HFONT) -> (i32, i32) {
     (metrics.tmHeight, metrics.tmAscent)
 }
 
-/// Height and ascent of the characters themselves, without the font's internal leading,
-/// which is empty space above them. Used for the bold marks.
-unsafe fn ink_height(hdc: HDC, font: HFONT) -> (i32, i32) {
-    let old = SelectObject(hdc, font);
-    let mut metrics = TEXTMETRICW::default();
-    let _ = GetTextMetricsW(hdc, &mut metrics);
-    SelectObject(hdc, old);
-    (metrics.tmHeight - metrics.tmInternalLeading, metrics.tmAscent - metrics.tmInternalLeading)
-}
-
-/// The biggest bold font that fits in `height`: 12 pt, else 10 pt, else 8 pt.
-unsafe fn mark_font(hdc: HDC, height: i32) -> HFONT {
-    let fonts = [MARK_BIG.get(), MARK_SMALL.get(), MARK_TINY.get()];
-    let heights = fonts.map(|font| if font.0.is_null() { i32::MAX } else { ink_height(hdc, font).0 });
-    fonts[pick_mark(&heights, height)]
-}
-
-/// Index of the first font height that fits in `room`, or the last one when none does.
-fn pick_mark(heights: &[i32], room: i32) -> usize {
-    heights.iter().position(|h| *h <= room).unwrap_or(heights.len() - 1)
+/// Bold at the same size as the list. A larger face is what spilled out of the line.
+fn mark_bold(normal: HFONT) -> HFONT {
+    let bold = MARK_TINY.get();
+    if bold.0.is_null() { normal } else { bold }
 }
 
 fn text_width(hdc: HDC, text: &[u16]) -> i32 {
@@ -3510,25 +3816,27 @@ fn text_width(hdc: HDC, text: &[u16]) -> i32 {
     size.cx
 }
 
-/// Draws one line, marked characters in `bold` and the rest in `normal`, on one baseline
-/// centered in `rect`. A last space or period is also drawn in reverse, `back` on `fore`,
-/// so it can be seen. A line that does not fit ends with "...".
-unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFONT, bold: HFONT, fore: COLORREF, back: COLORREF) {
+/// Draws one line. Plain characters use `normal` and stay where the list would put them.
+/// `:` and `.` are filled dots, because the bitmap font draws them as thin pixels.
+/// A trailing space is the same kind of dot, so it can be seen. A line that does not
+/// fit ends with "...".
+unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFONT, bold: HFONT, fore: COLORREF, _back: COLORREF) {
     let (normal_h, normal_up) = font_height(hdc, normal);
-    let (bold_h, bold_up) = ink_height(hdc, bold);
     let mut widths = Vec::with_capacity(marks.len());
-    for (ch, mark) in marks {
-        SelectObject(hdc, if *mark == Mark::Plain { normal } else { bold });
-        let mut buf = [0u16; 2];
-        widths.push(text_width(hdc, ch.encode_utf16(&mut buf)));
-    }
     SelectObject(hdc, normal);
+    for (ch, _) in marks {
+        let mut buf = [0u16; 2];
+        // The plain face's own width. A wider bold face shifts the rest of the line,
+        // so the list and the editor each show their own copy.
+        widths.push(text_width(hdc, ch.encode_utf16(&mut buf)).max(1));
+    }
     let dots: Vec<u16> = "...".encode_utf16().collect();
     let keep = fit_count(&widths, rect.right - rect.left, text_width(hdc, &dots));
-    let up = normal_up.max(bold_up);
-    let down = (normal_h - normal_up).max(bold_h - bold_up);
-    let baseline = marked_baseline(rect.top, rect.bottom, normal_h, normal_up, bold_h, bold_up);
+    let baseline = marked_baseline(rect.top, rect.bottom, normal_h, normal_up, normal_h, normal_up);
     let align = SetTextAlign(hdc, TEXT_ALIGN_OPTIONS(24));
+    // ':' and '.' are filled shapes in `fore`. A '?' is a glyph, so it needs the same color
+    // or a highlighted line leaves it black.
+    let _ = SetTextColor(hdc, fore);
     let mut x = rect.left;
     let mut start = 0;
     while start < keep {
@@ -3537,22 +3845,46 @@ unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFO
         while end < keep && marks[end].1 == mark {
             end += 1;
         }
-        let run: String = marks[start..end].iter().map(|(ch, _)| *ch).collect();
-        let wide: Vec<u16> = run.encode_utf16().collect();
-        SelectObject(hdc, if mark == Mark::Plain { normal } else { bold });
-        let width = text_width(hdc, &wide);
-        if mark == Mark::End {
-            let block = RECT { left: x, top: baseline - up, right: x + width, bottom: baseline + down };
-            let brush = CreateSolidBrush(fore);
-            let _ = FillRect(hdc, &block, brush);
-            let _ = DeleteObject(brush);
-            let _ = SetTextColor(hdc, back);
+        if mark == Mark::Plain {
+            SelectObject(hdc, normal);
+            let run: String = marks[start..end].iter().map(|(ch, _)| *ch).collect();
+            let wide: Vec<u16> = run.encode_utf16().collect();
             let _ = TextOutW(hdc, x, baseline, &wide);
-            let _ = SetTextColor(hdc, fore);
-        } else {
-            let _ = TextOutW(hdc, x, baseline, &wide);
+            x += text_width(hdc, &wide);
+            start = end;
+            continue;
         }
-        x += width;
+        let mut cx = x;
+        for (index, (ch, _)) in marks[start..end].iter().enumerate() {
+            let advance = widths[start + index].max(1);
+            let top = baseline - normal_up;
+            let cell_h = normal_h.max(1);
+            if *ch == ':' {
+                for (dx, dy, dw, dh) in colon_blocks(advance, cell_h) {
+                    fill_color(
+                        hdc,
+                        RECT { left: cx + dx, top: top + dy, right: cx + dx + dw, bottom: top + dy + dh },
+                        fore,
+                    );
+                }
+            } else if *ch == '.' || *ch == paths::SPACE_MARK {
+                // A bold period, including the last one. Filling the cell made it a black block.
+                let (dx, dy, dw, dh) = if *ch == '.' {
+                    period_block(advance, cell_h)
+                } else {
+                    space_block(advance, cell_h)
+                };
+                fill_color(
+                    hdc,
+                    RECT { left: cx + dx, top: top + dy, right: cx + dx + dw, bottom: top + dy + dh },
+                    fore,
+                );
+            } else {
+                paint_clipped_char(hdc, bold, cx, baseline, cx, top, advance, cell_h, *ch, fore);
+            }
+            cx += advance;
+        }
+        x = cx;
         start = end;
     }
     if keep < marks.len() {
@@ -3561,6 +3893,73 @@ unsafe fn draw_marked(hdc: HDC, rect: &RECT, marks: &[(char, Mark)], normal: HFO
     }
     SetTextAlign(hdc, TEXT_ALIGN_OPTIONS(align));
     SelectObject(hdc, normal);
+}
+
+/// Filled rectangles for a ':' inside one character cell, relative to its top-left.
+/// Each dot is at least 2 pixels wide when the cell has room, and the cell keeps a
+/// clear pixel on the right so the next ':' cannot join it. The last cell uses this
+/// same shape, so it is not thinner than the ones before it.
+fn colon_blocks(width: i32, height: i32) -> [(i32, i32, i32, i32); 2] {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut dot_w = if width < 3 { 1 } else { (width / 2).clamp(2, width - 1) };
+    let mut left = (width - dot_w) / 2;
+    if left + dot_w >= width && width >= 2 {
+        dot_w = width - 1 - left;
+        if dot_w < 1 {
+            left = 0;
+            dot_w = width - 1;
+        }
+    }
+    let gap = if height < 5 { 1 } else { 2 };
+    let mut dot_h = if height < 5 { 1 } else { (height / 4).clamp(2, 4) };
+    if dot_h * 2 + gap > height {
+        dot_h = ((height - gap).max(1)) / 2;
+    }
+    let dot_h = dot_h.max(1);
+    let dot_w = dot_w.max(1);
+    let used = dot_h * 2 + gap;
+    let top = ((height - used).max(0)) / 2;
+    let mut lower = top + dot_h + gap;
+    if lower + dot_h > height {
+        lower = (height - dot_h).max(0);
+    }
+    [(left, top, dot_w, dot_h), (left, lower, dot_w, dot_h)]
+}
+
+/// One filled dot for a period, the lower dot of a colon, so it stays on the baseline.
+/// The last period uses this same dot.
+fn period_block(width: i32, height: i32) -> (i32, i32, i32, i32) {
+    colon_blocks(width, height)[1]
+}
+
+/// A trailing space has no picture of its own. One dot, centered, stands in for it.
+fn space_block(width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let (x, _, w, h) = colon_blocks(width, height)[0];
+    let y = ((height.max(1) - h) / 2).max(0);
+    (x, y, w, h)
+}
+
+unsafe fn fill_color(hdc: HDC, rect: RECT, color: COLORREF) {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let brush = CreateSolidBrush(color);
+    let _ = FillRect(hdc, &rect, brush);
+    let _ = DeleteObject(brush);
+}
+
+unsafe fn paint_clipped_char(hdc: HDC, font: HFONT, x: i32, baseline: i32, left: i32, top: i32, width: i32, height: i32, ch: char, color: COLORREF) {
+    let saved = SaveDC(hdc);
+    IntersectClipRect(hdc, left, top, left + width, top + height);
+    SelectObject(hdc, font);
+    let _ = SetTextColor(hdc, color);
+    let mut buf = [0u16; 2];
+    let one = ch.encode_utf16(&mut buf);
+    let _ = TextOutW(hdc, x, baseline, one);
+    if saved != 0 {
+        let _ = RestoreDC(hdc, saved);
+    }
 }
 
 /// The plain text sits where the list would put it, centered in the row. The bigger
@@ -3985,7 +4384,17 @@ fn install_edit_keys(hwnd: HWND) {
     }
     unsafe {
         let _ = SetWindowSubclass(hwnd, Some(edit_keys_proc), EDIT_KEYS_SUBCLASS, 0);
+        if is_name_editor(hwnd) {
+            // The editor may already have painted the thin colon.
+            let _ = InvalidateRect(hwnd, None, false);
+        }
     }
+}
+
+/// The in-place editor of a Names list. Its parent is that list.
+fn is_name_editor(edit: HWND) -> bool {
+    let parent = unsafe { GetParent(edit) }.unwrap_or(HWND(std::ptr::null_mut()));
+    !parent.0.is_null() && class_name(parent) == "SysListView32" && (ID_LIST..ID_ALBUM).contains(&child_id(parent))
 }
 
 unsafe extern "system" fn edit_keys_proc(
@@ -3996,21 +4405,122 @@ unsafe extern "system" fn edit_keys_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if msg == WM_NCDESTROY {
+        let _ = RemoveWindowSubclass(hwnd, Some(edit_keys_proc), EDIT_KEYS_SUBCLASS);
+    }
+    let mut handled = false;
     if msg == WM_KEYDOWN {
         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
         let alt = GetKeyState(VK_MENU.0 as i32) < 0;
         if !alt && apply_edit_key(hwnd, wparam.0, shift, ctrl) {
-            return LRESULT(0);
+            handled = true;
         }
     }
     if msg == WM_CHAR && apply_edit_char(hwnd, wparam.0) {
-        return LRESULT(0);
+        handled = true;
     }
-    if msg == WM_NCDESTROY {
-        let _ = RemoveWindowSubclass(hwnd, Some(edit_keys_proc), EDIT_KEYS_SUBCLASS);
+    let result = if handled { LRESULT(0) } else { DefSubclassProc(hwnd, msg, wparam, lparam) };
+    // Moving the caret repaints the whole name in the plain font, and it does not
+    // always come through WM_PAINT. An arrow that clears the selection used to
+    // return before the marks were drawn again, so every ':' went thin together.
+    if name_editor_redraws(msg, wparam.0) && is_name_editor(hwnd) {
+        thicken_name_editor(hwnd);
     }
-    DefSubclassProc(hwnd, msg, wparam, lparam)
+    result
+}
+
+/// Messages where the editor paints its text itself. Query messages that
+/// `thicken_name_editor` sends are left out, or drawing one colon would recurse.
+fn name_editor_redraws(msg: u32, wparam: usize) -> bool {
+    match msg {
+        WM_PAINT | WM_KEYDOWN | WM_CHAR | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_HSCROLL => true,
+        // EM_SETSEL, EM_REPLACESEL, WM_SETTEXT, WM_CUT, WM_PASTE, WM_CLEAR, WM_UNDO, EM_UNDO, WM_SYSCHAR.
+        0x00B1 | 0x00C2 | 0x000C | 0x0300 | 0x0302 | 0x0303 | 0x0304 | 0x00C7 | 0x0106 => true,
+        // A drag selects, and the line is painted again. A plain move does not.
+        WM_MOUSEMOVE => wparam & 1 != 0,
+        _ => false,
+    }
+}
+
+/// The list editor draws the whole name in the plain font, so a ':' loses the thick
+/// mark the row has. Draw the marked characters again, the same way the row does.
+unsafe fn thicken_name_editor(edit: HWND) {
+    let already = THICKENING_NAME.with(|flag| flag.replace(true));
+    if already {
+        return;
+    }
+    thicken_name_editor_now(edit);
+    THICKENING_NAME.with(|flag| flag.set(false));
+}
+
+unsafe fn thicken_name_editor_now(edit: HWND) {
+    let places = edit_mark_places(&get_text(edit));
+    if places.is_empty() {
+        return;
+    }
+    let hidden = HideCaret(edit).is_ok();
+    let hdc = GetDC(edit);
+    if hdc.0.is_null() {
+        if hidden {
+            let _ = ShowCaret(edit);
+        }
+        return;
+    }
+    let normal = HFONT(SendMessageW(edit, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+    let bold = mark_bold(normal);
+    let old = SelectObject(hdc, normal);
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let (start, end) = edit_selection(edit);
+    let focused = GetFocus() == edit;
+    // The editor's own size. A larger face spills out of the cell and, after the
+    // line is left and opened again, leaves a second copy beside the highlight.
+    for (index, ch, mark) in places {
+        let pos = SendMessageW(edit, 0x00D6, WPARAM(index), LPARAM(0));
+        if pos.0 < 0 {
+            continue;
+        }
+        let x = (pos.0 as u32 & 0xFFFF) as i16 as i32;
+        let y = ((pos.0 as u32 >> 16) & 0xFFFF) as i16 as i32;
+        let selected = edit_mark_selected(index, start, end);
+        let (fore, back) = if selected && focused {
+            (COLOR_HIGHLIGHTTEXT, COLOR_HIGHLIGHT)
+        } else {
+            (COLOR_WINDOWTEXT, COLOR_WINDOW)
+        };
+        SelectObject(hdc, normal);
+        let mut buf = [0u16; 2];
+        let glyph = text_width(hdc, ch.encode_utf16(&mut buf)).max(1);
+        let (line_h, _) = font_height(hdc, normal);
+        let rect = RECT { left: x, top: y, right: x + glyph, bottom: y + line_h.max(1) };
+        // Wipe the editor's own thin glyph, then draw the same mark the row uses.
+        let _ = FillRect(hdc, &rect, GetSysColorBrush(back));
+        draw_marked(hdc, &rect, &[(ch, mark)], normal, bold, COLORREF(GetSysColor(fore)), COLORREF(GetSysColor(back)));
+    }
+    SelectObject(hdc, old);
+    let _ = ReleaseDC(edit, hdc);
+    if hidden {
+        let _ = ShowCaret(edit);
+    }
+}
+
+/// UTF-16 index and the character to draw for each marked character. The index is the
+/// editor's, so it lines up with EM_POSFROMCHAR and the selection.
+fn edit_mark_places(name: &str) -> Vec<(usize, char, Mark)> {
+    let marks = paths::name_marks(name);
+    let mut index = 0usize;
+    let mut places = Vec::new();
+    for (original, (shown, mark)) in name.chars().zip(marks) {
+        if mark != Mark::Plain {
+            places.push((index, shown, mark));
+        }
+        index += original.len_utf16();
+    }
+    places
+}
+
+fn edit_mark_selected(index: usize, start: usize, end: usize) -> bool {
+    start != end && index >= start && index < end
 }
 
 fn is_edit_class(class: &str) -> bool {
@@ -4230,19 +4740,18 @@ fn focus_next(shift: bool) {
         let Some(app) = borrow.as_ref() else {
             return;
         };
-        let mut stops = Vec::new();
-        unsafe {
-            let mut child_hwnd = neighbor(app.pane(), GW_CHILD);
-            while !child_hwnd.0.is_null() {
-                let style = GetWindowLongPtrW(child_hwnd, GWL_STYLE) as u32;
-                if style & 0x00010000 != 0 && IsWindowVisible(child_hwnd).0 != 0 && IsWindowEnabled(child_hwnd).0 != 0 {
-                    stops.push(child_hwnd);
-                }
-                child_hwnd = neighbor(child_hwnd, GW_HWNDNEXT);
-            }
-        }
-        // GetWindow walks top-to-bottom z-order, which is reverse creation. Flip it.
-        stops.reverse();
+        // Creation order is tab order. GetWindow already walks children in creation order, so the
+        // old reverse of that list sent Tab backwards.
+        let stops: Vec<HWND> = app
+            .kids
+            .iter()
+            .map(|kid| kid.hwnd)
+            .filter(|hwnd| {
+                let style = unsafe { GetWindowLongPtrW(*hwnd, GWL_STYLE) as u32 };
+                style & 0x00010000 != 0 && enabled_visible(*hwnd)
+            })
+            .collect();
+        let mut stops = stops;
         if unsafe { IsWindowEnabled(app.back).0 != 0 } {
             stops.push(app.back);
         }
@@ -4312,66 +4821,129 @@ fn activate_default() -> bool {
     true
 }
 
+/// What a control is, as far as Alt+letter is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MnemonicKind {
+    /// A push button: Alt+letter clicks it.
+    Push,
+    /// A check box or radio button: Alt+letter focuses it and clicks it, which toggles or selects it.
+    Toggle,
+    /// A static label: Alt+letter focuses the next control that takes Tab.
+    Label,
+    /// Anything else (edit, combo box, list). Never named by its own text.
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MnemonicSlot {
+    kind: MnemonicKind,
+    letter: Option<char>,
+    /// Enabled and visible. A disabled or hidden control never fires and is never a label's target.
+    live: bool,
+    tab_stop: bool,
+}
+
+/// Picks the control that Alt+`ch` should act on, given the controls in creation (tab) order.
+/// Returns the index of the control to act on. A label resolves to the next live tab stop after
+/// it. When several controls share a letter, the first one after `focus` wins, so pressing the
+/// shortcut again moves on to the next one, the way Windows dialogs do.
+fn pick_mnemonic(slots: &[MnemonicSlot], ch: char, focus: Option<usize>) -> Option<usize> {
+    let ch = ch.to_ascii_uppercase();
+    let mut hits = Vec::new();
+    for (index, slot) in slots.iter().enumerate() {
+        if slot.letter != Some(ch) || !slot.live {
+            continue;
+        }
+        let target = match slot.kind {
+            MnemonicKind::Push | MnemonicKind::Toggle => Some(index),
+            MnemonicKind::Label => slots.iter().enumerate().skip(index + 1).find(|(_, next)| next.tab_stop && next.live).map(|(i, _)| i),
+            MnemonicKind::Other => None,
+        };
+        if let Some(target) = target {
+            if !hits.contains(&target) {
+                hits.push(target);
+            }
+        }
+    }
+    let start = focus.unwrap_or(usize::MAX);
+    hits.iter().copied().find(|hit| focus.is_some() && *hit > start).or_else(|| hits.first().copied())
+}
+
+fn mnemonic_kind(hwnd: HWND) -> MnemonicKind {
+    let class = class_name(hwnd);
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 };
+    if class.eq_ignore_ascii_case("Button") {
+        match style & 0xF {
+            // BS_CHECKBOX, BS_AUTOCHECKBOX, BS_RADIOBUTTON, BS_3STATE, BS_AUTO3STATE, BS_AUTORADIOBUTTON
+            2 | 3 | 4 | 5 | 6 | 9 => MnemonicKind::Toggle,
+            // BS_GROUPBOX: acts like a label for the control after it.
+            7 => MnemonicKind::Label,
+            _ => MnemonicKind::Push,
+        }
+    } else if class.eq_ignore_ascii_case("Static") {
+        // SS_NOPREFIX shows the & as text, so it is not a shortcut.
+        if style & 0x80 != 0 { MnemonicKind::Other } else { MnemonicKind::Label }
+    } else {
+        MnemonicKind::Other
+    }
+}
+
 fn activate_mnemonic(ch: char) -> bool {
-    let targets = APP.with(|slot| {
+    // Creation order is tab order. Page controls first, then Back and Next.
+    let order = APP.with(|slot| {
         let borrow = slot.borrow();
         let Some(app) = borrow.as_ref() else {
             return Vec::new();
         };
-        let mut found = Vec::new();
-        collect_mnemonics(app.pane(), ch, &mut found);
-        collect_mnemonics(app.hwnd, ch, &mut found);
-        found
+        let mut order: Vec<HWND> = app.kids.iter().map(|kid| kid.hwnd).collect();
+        order.push(app.back);
+        order.push(app.next);
+        order
     });
-    let Some(target) = targets.into_iter().find(|hwnd| unsafe { IsWindowEnabled(*hwnd).0 != 0 && IsWindowVisible(*hwnd).0 != 0 }) else {
+    let order: Vec<HWND> = order.into_iter().filter(|hwnd| !hwnd.0.is_null()).collect();
+    let slots: Vec<MnemonicSlot> = order
+        .iter()
+        .map(|hwnd| {
+            let kind = mnemonic_kind(*hwnd);
+            let style = unsafe { GetWindowLongPtrW(*hwnd, GWL_STYLE) as u32 };
+            MnemonicSlot {
+                kind,
+                letter: if kind == MnemonicKind::Other { None } else { accel_char(&get_text(*hwnd)) },
+                live: enabled_visible(*hwnd),
+                tab_stop: style & 0x00010000 != 0,
+            }
+        })
+        .collect();
+    let focus = unsafe { GetFocus() };
+    // Focus may sit inside a control (the edit inside a combo box), so match its parent too.
+    let parent = unsafe { GetParent(focus).unwrap_or(HWND(std::ptr::null_mut())) };
+    let at = order.iter().position(|hwnd| *hwnd == focus || *hwnd == parent);
+    let Some(index) = pick_mnemonic(&slots, ch, at) else {
         return false;
     };
-    let class = class_name(target);
-    unsafe { let _ = SetFocus(target); }
-    if class == "Button" {
-        unsafe { SendMessageW(target, 0x00F5, WPARAM(0), LPARAM(0)); }
-    }
-    true
-}
-
-fn collect_mnemonics(parent: HWND, ch: char, out: &mut Vec<HWND>) {
+    let target = order[index];
     unsafe {
-        let mut child_hwnd = neighbor(parent, GW_CHILD);
-        while !child_hwnd.0.is_null() {
-            let text = get_text(child_hwnd);
-            if accel_char(&text) == Some(ch) {
-                let class = class_name(child_hwnd);
-                if class == "Static" {
-                    // The next tab stop is the control this label names. Creation order was reversed.
-                } else {
-                    out.push(child_hwnd);
-                }
+        match slots[index].kind {
+            MnemonicKind::Push => {
+                // The click may rebuild the page, so nothing touches the button afterwards.
+                SendMessageW(target, 0x00F5, WPARAM(0), LPARAM(0));
+                return true;
             }
-            child_hwnd = neighbor(child_hwnd, GW_HWNDNEXT);
-        }
-    }
-    if out.is_empty() {
-        // Static label: focus the following tab stop, searched in creation order.
-        let mut stops = Vec::new();
-        unsafe {
-            let mut child_hwnd = neighbor(parent, GW_CHILD);
-            while !child_hwnd.0.is_null() {
-                stops.push(child_hwnd);
-                child_hwnd = neighbor(child_hwnd, GW_HWNDNEXT);
+            MnemonicKind::Toggle => {
+                let _ = SetFocus(target);
+                SendMessageW(target, 0x00F5, WPARAM(0), LPARAM(0));
             }
-        }
-        stops.reverse();
-        for (index, hwnd) in stops.iter().enumerate() {
-            if accel_char(&get_text(*hwnd)) == Some(ch) && class_name(*hwnd) == "Static" {
-                if let Some(next) = stops.iter().skip(index + 1).find(|candidate| {
-                    let style = unsafe { GetWindowLongPtrW(**candidate, GWL_STYLE) as u32 };
-                    style & 0x00010000 != 0
-                }) {
-                    out.push(*next);
+            _ => {
+                let _ = SetFocus(target);
+                if class_name(target).eq_ignore_ascii_case("Edit") {
+                    // Like a dialog: jumping to a text box selects what is in it.
+                    SendMessageW(target, 0x00B1, WPARAM(0), LPARAM(-1));
                 }
             }
         }
     }
+    reveal_window(target);
+    true
 }
 
 fn enable(hwnd: HWND, value: bool) {
@@ -4383,10 +4955,15 @@ fn neighbor(hwnd: HWND, cmd: windows::Win32::UI::WindowsAndMessaging::GET_WINDOW
 }
 
 fn accel_char(text: &str) -> Option<char> {
-    let chars: Vec<char> = text.chars().collect();
-    for (index, ch) in chars.iter().enumerate() {
-        if *ch == '&' && index + 1 < chars.len() && chars[index + 1] != '&' {
-            return Some(chars[index + 1].to_ascii_uppercase());
+    // "&&" is a literal ampersand. The first single "&" marks the shortcut letter.
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '&' {
+            match chars.next() {
+                Some('&') => continue,
+                Some(letter) if !letter.is_whitespace() => return Some(letter.to_ascii_uppercase()),
+                _ => return None,
+            }
         }
     }
     None
@@ -4429,6 +5006,12 @@ fn group_of(id: i32) -> usize {
         _ => id,
     };
     (id - base) as usize
+}
+
+/// Start over is offered once a download run has finished and the window is idle.
+/// A run that saved files counts the same as a run where every item failed.
+fn offer_start_over(download_done: bool, idle: bool) -> bool {
+    download_done && idle
 }
 
 fn button_bits(default: bool) -> u32 {
@@ -4594,7 +5177,70 @@ fn font_bits(font: HFONT) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_over_is_offered_when_the_run_finishes() {
+        assert!(super::offer_start_over(true, true));
+        assert!(!super::offer_start_over(true, false));
+        assert!(!super::offer_start_over(false, true));
+    }
+
     use super::*;
+
+    fn slot(kind: MnemonicKind, letter: Option<char>, live: bool, tab_stop: bool) -> MnemonicSlot {
+        MnemonicSlot { kind, letter, live, tab_stop }
+    }
+
+    #[test]
+    fn mnemonic_button_and_checkbox_pick_themselves() {
+        let slots = [
+            slot(MnemonicKind::Push, Some('S'), true, true),
+            slot(MnemonicKind::Toggle, Some('Y'), true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 's', None), Some(0));
+        assert_eq!(pick_mnemonic(&slots, 'y', None), Some(1));
+        assert_eq!(pick_mnemonic(&slots, 'q', None), None);
+    }
+
+    #[test]
+    fn mnemonic_label_focuses_next_live_tab_stop() {
+        let slots = [
+            slot(MnemonicKind::Label, Some('N'), true, false),
+            slot(MnemonicKind::Other, None, false, true),
+            slot(MnemonicKind::Label, None, true, false),
+            slot(MnemonicKind::Other, None, true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 'n', None), Some(3));
+    }
+
+    #[test]
+    fn mnemonic_skips_disabled_and_hidden() {
+        let slots = [
+            slot(MnemonicKind::Toggle, Some('E'), false, true),
+            slot(MnemonicKind::Push, Some('E'), true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 'e', None), Some(1));
+        let none = [slot(MnemonicKind::Push, Some('E'), false, true)];
+        assert_eq!(pick_mnemonic(&none, 'e', None), None);
+    }
+
+    #[test]
+    fn mnemonic_repeats_cycle_through_clashes() {
+        let slots = [
+            slot(MnemonicKind::Push, Some('R'), true, true),
+            slot(MnemonicKind::Other, None, true, true),
+            slot(MnemonicKind::Push, Some('R'), true, true),
+        ];
+        assert_eq!(pick_mnemonic(&slots, 'r', None), Some(0));
+        assert_eq!(pick_mnemonic(&slots, 'r', Some(0)), Some(2));
+        assert_eq!(pick_mnemonic(&slots, 'r', Some(2)), Some(0));
+    }
+
+    #[test]
+    fn accel_char_reads_the_marked_letter() {
+        assert_eq!(accel_char("Audio onl&y"), Some('Y'));
+        assert_eq!(accel_char("Rock && Roll"), None);
+        assert_eq!(accel_char("Tom && &Jerry"), Some('J'));
+    }
 
     #[test]
     fn a_mouse_notch_moves_a_whole_step() {
@@ -4692,18 +5338,6 @@ mod tests {
         assert_eq!(marked_baseline(10, 24, 13, 11, 13, 11), 10 + 0 + 11);
         // A bold font taller than the room keeps its top inside.
         assert_eq!(marked_baseline(0, 14, 13, 11, 16, 13), 13);
-    }
-
-    #[test]
-    fn the_biggest_mark_font_that_fits_is_used() {
-        // 12, 10 and 8 pt at 96 DPI.
-        let heights = [16, 13, 13];
-        assert_eq!(pick_mark(&heights, 18), 0);
-        assert_eq!(pick_mark(&heights, 16), 0);
-        assert_eq!(pick_mark(&heights, 14), 1);
-        // At 120 DPI: 20, 17 and 13 pixels in a 15 pixel row.
-        assert_eq!(pick_mark(&[20, 17, 13], 15), 2);
-        assert_eq!(pick_mark(&[20, 17, 13], 10), 2);
     }
 
     #[test]
@@ -4970,5 +5604,101 @@ mod layout_tests {
         assert_eq!(super::chrome_view_h(477, 21, 46, 46), 364);
         // Counting only the header and bar would leave the last rows under the bar.
         assert!(super::chrome_view_h(477, 21, 46, 46) < 480 - 46 - 46);
+    }
+}
+
+#[cfg(test)]
+mod names_page_tests {
+    use super::{colon_blocks, fit_count, list_height, name_row_paint, period_block, space_block, RowPaint};
+
+    #[test]
+    fn a_colon_is_thick_and_the_last_one_matches() {
+        for (width, height) in [(4, 13), (5, 16), (8, 18), (3, 12)] {
+            let dots = colon_blocks(width, height);
+            // The last character is this same shape, so it cannot come out thinner.
+            assert_eq!(colon_blocks(width, height), dots);
+            let mut right = 0;
+            for (index, (x, y, w, h)) in dots.into_iter().enumerate() {
+                assert!(w >= 2, "a colon dot should be thicker than one pixel");
+                assert!(h >= 2);
+                assert!(x >= 0 && y >= 0);
+                assert!(x + w < width, "a colon must keep a gap before the next one");
+                assert!(y + h <= height);
+                right = right.max(x + w);
+                if index == 1 {
+                    assert!(dots[0].1 + dots[0].3 <= y, "the two dots of a colon must not meet");
+                }
+            }
+            assert!(right < width);
+        }
+        // A period is the colon's lower dot, including the last one. It is not the whole cell.
+        let period = period_block(4, 13);
+        assert_eq!(period, colon_blocks(4, 13)[1]);
+        assert!(period.2 >= 2 && period.3 >= 2);
+        assert!(period.0 + period.2 < 4);
+        assert!(period.3 < 13);
+        let space = space_block(4, 13);
+        assert!(space.2 >= 2);
+        assert!(space.0 + space.2 < 4);
+        assert!(space.1 + space.3 <= 13);
+    }
+
+    #[test]
+    fn one_copy_of_the_name_is_drawn() {
+        // The list's subitem pass would paint the plain colon over the mark.
+        assert_eq!(name_row_paint(0x0003_0001, true, false), RowPaint::Skip);
+        // Opening the line hands the name to the editor. The row must not paint it too.
+        assert_eq!(name_row_paint(0x0001_0001, true, true), RowPaint::Behind);
+        // A closed line is painted once, not again after the list's own text.
+        assert_eq!(name_row_paint(0x0001_0001, true, false), RowPaint::Marks);
+        assert_eq!(name_row_paint(0x0001_0002, true, false), RowPaint::Ignore);
+        assert_eq!(name_row_paint(0x0001, true, false), RowPaint::Ask);
+        assert_eq!(name_row_paint(0x0001_0001, false, false), RowPaint::Ignore);
+    }
+
+    #[test]
+    fn the_list_is_tall_enough_for_every_row() {
+        // 100%: 6 pixel frame, 20 pixel header, 17 pixel rows.
+        assert_eq!(list_height(6, 20, 17, 3), 6 + 20 + 51 + 2);
+        // 125%: taller header and rows still fit every name, the last one included.
+        let h = list_height(6, 25, 21, 8);
+        assert!(h - 6 - 25 >= 8 * 21);
+        // At least one row's room even for an empty list.
+        assert_eq!(list_height(6, 20, 17, 0), 6 + 20 + 17 + 2);
+    }
+
+    #[test]
+    fn moving_the_caret_redraws_every_colon() {
+        assert!(super::name_editor_redraws(super::WM_KEYDOWN, 0));
+        assert!(super::name_editor_redraws(super::WM_CHAR, 0));
+        assert!(super::name_editor_redraws(super::WM_LBUTTONDOWN, 0));
+        assert!(super::name_editor_redraws(0x00B1, 0));
+        assert!(super::name_editor_redraws(super::WM_MOUSEMOVE, 1));
+        // Asking for the text or a character position must not draw again.
+        assert!(!super::name_editor_redraws(super::WM_MOUSEMOVE, 0));
+        assert!(!super::name_editor_redraws(super::WM_GETTEXT, 0));
+        assert!(!super::name_editor_redraws(0x00B0, 0));
+        assert!(!super::name_editor_redraws(0x00D6, 0));
+    }
+
+    #[test]
+    fn a_selected_line_keeps_the_thick_colon() {
+        // The editor stores UTF-16 indexes. The colon in "A:B" is the second unit.
+        assert_eq!(super::edit_mark_places("A:B"), vec![(1, ':', super::Mark::Bad)]);
+        assert!(super::edit_mark_selected(1, 0, 3));
+        assert!(super::edit_mark_selected(1, 1, 2));
+        assert!(!super::edit_mark_selected(1, 0, 1));
+        assert!(!super::edit_mark_selected(1, 2, 3));
+        // A trailing period is still marked, at its own index.
+        assert_eq!(super::edit_mark_places("file."), vec![(4, '.', super::Mark::End)]);
+    }
+
+    #[test]
+    fn widened_marks_still_count_toward_the_fit() {
+        // fit_count uses the width it is given, so a wider mark leaves fewer characters.
+        let widths = [5, 5, 6, 5];
+        assert_eq!(fit_count(&widths, 22, 6), 4);
+        assert_eq!(fit_count(&widths, 20, 6), 2);
+        assert_eq!(fit_count(&widths, 16, 6), 2);
     }
 }

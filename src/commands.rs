@@ -13,6 +13,12 @@ pub const PROGRESS_TEMPLATE: &str =
 /// video and audio parts, yt-dlp gives the size of both parts together here.
 pub const EXPECTED_PRINT: &str = "before_dl:expected_bytes:%(filesize,filesize_approx)s";
 
+/// Printed once per video by the size pass, before anything is downloaded.
+/// `filesize` is the byte count when the site sent one. `filesize_approx` is
+/// bitrate times length when it did not. For separate picture and audio, yt-dlp
+/// adds the two parts together, the same number `EXPECTED_PRINT` reads later.
+pub const SIZE_PRINT: &str = "size:%(id)s|%(filesize,filesize_approx)s";
+
 /// yt-dlp reads the first `after_move:` as when to print and leaves it out of the
 /// output, so it is written twice to keep the prefix `parse_after_move` looks for.
 pub const SAVED_PATH_PRINT: &str = "after_move:after_move:%(filepath)s";
@@ -212,6 +218,33 @@ pub fn download_args(opts: &Options, url: &str, playlist_item: Option<u32>, outp
     }
     args.push("--".into());
     args.push(url.into());
+    args
+}
+
+/// Sizes of the files this run will save, without downloading them.
+/// `playlist_items` is `Some("1,3,4")` for one playlist URL. Direct video URLs
+/// pass `None` and are read with `--no-playlist`.
+pub fn size_args(opts: &Options, urls: &[String], playlist_items: Option<&str>, node: &Path, ffmpeg_dir: &Path) -> Vec<String> {
+    let mut args = tool_args(node, ffmpeg_dir);
+    args.extend([
+        "--encoding".into(),
+        "utf-8".into(),
+        "--skip-download".into(),
+        "--ignore-errors".into(),
+        "--no-warnings".into(),
+        "-f".into(),
+        format_selector(opts),
+        "--print".into(),
+        SIZE_PRINT.into(),
+    ]);
+    if let Some(items) = playlist_items {
+        args.push("--playlist-items".into());
+        args.push(items.to_string());
+    } else {
+        args.push("--no-playlist".into());
+    }
+    args.push("--".into());
+    args.extend(urls.iter().cloned());
     args
 }
 
@@ -669,6 +702,18 @@ pub fn parse_expected_bytes(line: &str) -> Option<u64> {
     number_u64(line.trim().strip_prefix("expected_bytes:")?).filter(|bytes| *bytes > 0)
 }
 
+/// `size:videoId|252182` from the size pass. `NA` and `0` are unknown.
+pub fn parse_size_line(line: &str) -> Option<(String, u64)> {
+    let rest = line.trim().strip_prefix("size:")?;
+    let (id, bytes) = rest.split_once('|')?;
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let bytes = number_u64(bytes).filter(|bytes| *bytes > 0)?;
+    Some((id.to_string(), bytes))
+}
+
 pub fn parse_after_move(line: &str) -> Option<String> {
     let path = line.trim().strip_prefix("after_move:")?.trim();
     if path.is_empty() { None } else { Some(path.to_string()) }
@@ -701,6 +746,12 @@ pub fn wait_seconds(min: u32, max: u32, rng: &mut u32) -> u32 {
     }
     *rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
     min + (*rng % (max - min + 1))
+}
+
+/// One pause for each gap between `downloads` files, rolled now so Time left can
+/// count the same seconds the run will wait.
+pub fn wait_plan(downloads: usize, min: u32, max: u32, rng: &mut u32) -> Vec<u32> {
+    (0..downloads.saturating_sub(1)).map(|_| wait_seconds(min, max, rng)).collect()
 }
 
 #[cfg(test)]
@@ -999,6 +1050,46 @@ mod tests {
         assert_eq!(parse_expected_bytes("expected_bytes:0"), None);
         assert_eq!(parse_expected_bytes("download:downloading|1|2|NA|3"), None);
         assert!(parse_progress("expected_bytes:437474").is_none());
+    }
+
+    #[test]
+    fn size_args_ask_for_the_selected_format_without_downloading() {
+        let opts = video_opts();
+        let urls = ["https://example.com/a".to_string(), "https://example.com/b".to_string()];
+        let args = size_args(&opts, &urls, None, Path::new("node.exe"), Path::new("."));
+        assert!(args.iter().any(|arg| arg == "--skip-download"));
+        assert!(args.iter().any(|arg| arg == "--ignore-errors"));
+        assert!(args.iter().any(|arg| arg == "--no-playlist"));
+        assert!(args.windows(2).any(|pair| pair[0] == "--print" && pair[1] == SIZE_PRINT));
+        assert!(args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == format_selector(&opts)));
+        assert!(args.ends_with(&["--".into(), urls[0].clone(), urls[1].clone()]));
+    }
+
+    #[test]
+    fn size_args_for_a_playlist_use_item_numbers() {
+        let args = size_args(&video_opts(), &["https://example.com/list".into()], Some("1,3"), Path::new("node.exe"), Path::new("."));
+        assert!(args.windows(2).any(|pair| pair[0] == "--playlist-items" && pair[1] == "1,3"));
+        assert!(!args.iter().any(|arg| arg == "--no-playlist"));
+    }
+
+    #[test]
+    fn size_lines_parse() {
+        assert_eq!(parse_size_line("size:abc|252182"), Some(("abc".into(), 252182)));
+        assert_eq!(parse_size_line("size:abc|NA"), None);
+        assert_eq!(parse_size_line("size:abc|0"), None);
+        assert_eq!(parse_size_line("download:downloading|1|2|NA|3"), None);
+    }
+
+    #[test]
+    fn wait_plan_rolls_one_pause_between_each_download() {
+        let mut rng = 1u32;
+        let waits = wait_plan(3, 4, 8, &mut rng);
+        assert_eq!(waits.len(), 2);
+        assert!(waits.iter().all(|seconds| (4..=8).contains(seconds)));
+        let mut again = 1u32;
+        assert_eq!(wait_plan(3, 4, 8, &mut again), waits);
+        assert!(wait_plan(1, 4, 8, &mut rng).is_empty());
+        assert!(wait_plan(0, 4, 8, &mut rng).is_empty());
     }
 
     #[test]
