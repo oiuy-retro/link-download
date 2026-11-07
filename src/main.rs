@@ -2,6 +2,7 @@
 
 mod classify;
 mod conf;
+mod folders;
 mod classic;
 mod commands;
 mod model;

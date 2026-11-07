@@ -806,9 +806,12 @@ fn browse() {
         let app = app.as_ref().unwrap();
         (app.hwnd, get_text(app.location_hwnd))
     });
-    let Some(path) = pick_folder(hwnd, &current) else {
+    // Opens where this button last left off (or the closest folder that still exists).
+    let start = crate::folders::start(crate::folders::OUTPUT, &current).map(|path| path.display().to_string()).unwrap_or_default();
+    let Some(path) = pick_folder(hwnd, &start) else {
         return;
     };
+    crate::folders::remember(crate::folders::OUTPUT, &path);
     APP.with(|slot| {
         let mut borrow = slot.borrow_mut();
         let app = borrow.as_mut().unwrap();
