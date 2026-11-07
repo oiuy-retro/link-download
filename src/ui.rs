@@ -294,9 +294,6 @@ struct App {
     media_stamp: Options,
     have_media: bool,
     download_done: bool,
-    /// The last download run ended with every item failed. The Download page then
-    /// offers Start over.
-    all_failed: bool,
     ytdlp: PathBuf,
     ffmpeg: PathBuf,
     node: PathBuf,
@@ -884,7 +881,6 @@ impl App {
             media_stamp: Options::default(),
             have_media: false,
             download_done: false,
-            all_failed: false,
             ytdlp: PathBuf::new(),
             ffmpeg: PathBuf::new(),
             node: PathBuf::new(),
@@ -1614,7 +1610,7 @@ impl App {
             self.readout[index] = self.static_text(lx + label_w, ly, value_w, self.s(16), "—", false);
             set_id(self.readout[index], ID_READOUT + index as i32);
         }
-        if self.all_failed && self.busy == Busy::Idle {
+        if offer_start_over(self.download_done, self.busy == Busy::Idle) {
             // In the empty third column of the second row of readouts.
             let bw = self.s(75);
             let button = self.button(w - self.s(8) - bw, y + self.s(18), bw, "&Start over", ID_START_OVER, false);
@@ -2226,15 +2222,13 @@ impl App {
         Action::None
     }
 
-    /// Start over, after a run where every download failed: back to the first page as
-    /// if the program had just opened. The options and the pasted links are kept, so
-    /// the user can change what made the downloads fail and press Next again. The
-    /// links are looked up again, because nothing from the failed run is reused.
+    /// Start over, once a download run has finished: back to the first page as if the
+    /// program had just opened. The options and the pasted links are kept. The links
+    /// are looked up again, because nothing from the finished run is reused.
     fn start_over(&mut self) {
         if self.busy != Busy::Idle {
             return;
         }
-        self.all_failed = false;
         self.download_done = false;
         self.fetch_ok = false;
         self.fetched_text.clear();
@@ -2257,7 +2251,6 @@ impl App {
         }
         if self.page == 5 {
             self.download_done = false;
-            self.all_failed = false;
         }
         self.page -= 1;
         self.rebuild();
@@ -2903,13 +2896,10 @@ impl App {
                 self.download_done = true;
                 self.have_media = true;
                 self.media_stamp = self.options.clone();
-                self.all_failed = all_failed(live.ok, live.bad);
-                if self.all_failed {
-                    // Puts the Start over button on the page, then fills the
-                    // status line, bar, and readouts back in.
-                    self.rebuild();
-                    self.paint_readouts(&live);
-                }
+                // Puts Start over on the page, then fills the status line, bar,
+                // and readouts back in.
+                self.rebuild();
+                self.paint_readouts(&live);
                 self.refresh_nav();
                 unsafe { let _ = InvalidateRect(self.list_hwnd, None, false); }
             }
@@ -4475,9 +4465,10 @@ fn group_of(id: i32) -> usize {
     (id - base) as usize
 }
 
-/// Every item in the run failed (or was unavailable), so nothing was saved.
-fn all_failed(ok: u32, bad: u32) -> bool {
-    ok == 0 && bad > 0
+/// Start over is offered once a download run has finished and the window is idle.
+/// A run that saved files counts the same as a run where every item failed.
+fn offer_start_over(download_done: bool, idle: bool) -> bool {
+    download_done && idle
 }
 
 fn button_bits(default: bool) -> u32 {
@@ -4644,10 +4635,10 @@ fn font_bits(font: HFONT) -> usize {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn start_over_only_when_every_item_failed() {
-        assert!(super::all_failed(0, 3));
-        assert!(!super::all_failed(1, 2));
-        assert!(!super::all_failed(0, 0));
+    fn start_over_is_offered_when_the_run_finishes() {
+        assert!(super::offer_start_over(true, true));
+        assert!(!super::offer_start_over(true, false));
+        assert!(!super::offer_start_over(false, true));
     }
 
     use super::*;
