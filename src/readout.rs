@@ -59,23 +59,24 @@ pub fn items_per_minute(finished: f64, elapsed_seconds: f64) -> f64 {
     finished / (elapsed / 60.0).max(1.0)
 }
 
-/// Time left with a unit on every field, and no seconds: 12D:05H:05M.
-/// Seconds are rounded into the minutes. Leading units that are zero are left
-/// out (01H:05M, 05M), but minutes always show.
+/// Time left with a unit on every field, seconds included: 12D:05H:05M:04S.
+/// Leading units that are zero are left out (01H:05M:00S, 05M:04S), but
+/// minutes and seconds always show.
 pub fn format_eta(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "Calculating...".into();
     }
-    let total_minutes = (seconds / 60.0).round().max(0.0) as u64;
-    let days = total_minutes / (24 * 60);
-    let hours = (total_minutes / 60) % 24;
-    let minutes = total_minutes % 60;
+    let total = seconds.round().max(0.0) as u64;
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let secs = total % 60;
     if days > 0 {
-        format!("{days:02}D:{hours:02}H:{minutes:02}M")
+        format!("{days:02}D:{hours:02}H:{minutes:02}M:{secs:02}S")
     } else if hours > 0 {
-        format!("{hours:02}H:{minutes:02}M")
+        format!("{hours:02}H:{minutes:02}M:{secs:02}S")
     } else {
-        format!("{minutes:02}M")
+        format!("{minutes:02}M:{secs:02}S")
     }
 }
 
@@ -396,20 +397,16 @@ mod tests {
 
     #[test]
     fn time_left_shows_units() {
-        assert_eq!(format_eta(0.0), "00M");
-        assert_eq!(format_eta(2.0), "00M");
-        assert_eq!(format_eta(29.0), "00M");
-        assert_eq!(format_eta(30.0), "01M");
-        assert_eq!(format_eta(90.0), "02M");
-        assert_eq!(format_eta(59.6), "01M");
-        assert_eq!(format_eta(3599.0), "01H:00M");
-        assert_eq!(format_eta(3600.0), "01H:00M");
-        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0), "05H:10M");
-        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0 + 29.0), "05H:10M");
-        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0 + 30.0), "05H:11M");
-        assert_eq!(format_eta(86_400.0), "01D:00H:00M");
-        assert_eq!(format_eta(12.0 * 86_400.0 + 5.0 * 3600.0 + 5.0 * 60.0 + 4.0), "12D:05H:05M");
-        assert_eq!(format_eta(120.0 * 86_400.0), "120D:00H:00M");
+        assert_eq!(format_eta(0.0), "00M:00S");
+        assert_eq!(format_eta(2.0), "00M:02S");
+        assert_eq!(format_eta(90.0), "01M:30S");
+        assert_eq!(format_eta(59.6), "01M:00S");
+        assert_eq!(format_eta(3599.0), "59M:59S");
+        assert_eq!(format_eta(3600.0), "01H:00M:00S");
+        assert_eq!(format_eta(5.0 * 3600.0 + 10.0 * 60.0), "05H:10M:00S");
+        assert_eq!(format_eta(86_400.0), "01D:00H:00M:00S");
+        assert_eq!(format_eta(12.0 * 86_400.0 + 5.0 * 3600.0 + 5.0 * 60.0 + 4.0), "12D:05H:05M:04S");
+        assert_eq!(format_eta(120.0 * 86_400.0), "120D:00H:00M:00S");
         assert_eq!(format_eta(-1.0), "Calculating...");
         assert_eq!(format_eta(f64::NAN), "Calculating...");
     }

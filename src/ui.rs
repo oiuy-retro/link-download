@@ -1672,7 +1672,7 @@ impl App {
             let row = (index / 3) as i32;
             let lx = self.s(8) + col * col_w;
             let ly = y + row * self.s(18);
-            // Time left needs room for 01D:05H:10M. Elapsed still shows seconds. Calculating... is wider.
+            // Time left and Elapsed need room for 01D:05H:10M:00S. Calculating... is wider.
             let timer = index == 3 || index == 4;
             let label_w = if timer {
                 self.s(72)

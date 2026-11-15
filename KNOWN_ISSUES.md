@@ -37,3 +37,7 @@ Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/iss
 ## Progress bar gaps are uneven
 
 [#40](https://github.com/oiuy-retro/link-download/issues/40). The gaps between the navy blocks are not all the same width. This branch keeps every block at 8 pixels and every gap at 2. The bar is a little shorter when the width is not an exact fit. The window opens at a size where the bottom bar and the row bars already fit.
+
+## Time left seconds
+
+[#41](https://github.com/oiuy-retro/link-download/issues/41). Time left had been rounded to the nearest minute. Seconds stay, in the same form as before: 05H:10M:00S and 12D:05H:05M:04S. Items per minute is unchanged.
