@@ -3562,13 +3562,11 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
 }
 
 /// Navy blocks inside a track of `width` pixels, as `(left, right)` pairs.
-/// Blocks are 8 pixels with a 2 pixel gap. While the bar is still filling, the
-/// last block may stop on any pixel of that 8. At 100% the last solid piece
-/// meets the right edge. A short stub after a gap is joined onto the block
-/// before it, so the finished bar does not end as a sliver.
+/// Every block is 8 pixels. Gaps are 2 pixels, with a spare pixel shared
+/// across the gaps so the last block still ends on the right edge. A block
+/// never grows to soak up that spare width. While the bar is still filling,
+/// the last block may stop on any pixel of its 8.
 fn chunk_spans(width: i32, fraction: f64) -> Vec<(i32, i32)> {
-    const CHUNK: i32 = 8;
-    const GAP: i32 = 2;
     if width <= 0 {
         return Vec::new();
     }
@@ -3588,37 +3586,42 @@ fn chunk_spans(width: i32, fraction: f64) -> Vec<(i32, i32)> {
         return Vec::new();
     }
     let mut spans = Vec::new();
-    let mut x = 0;
-    while x < filled {
-        let block_right = (x + CHUNK).min(width);
-        let right = block_right.min(filled);
-        if right > x {
-            spans.push((x, right));
-        }
-        let next = block_right + GAP;
-        if next <= x {
+    for (left, right) in block_layout(width) {
+        if left >= filled {
             break;
         }
-        x = next;
+        let right = right.min(filled);
+        if right > left {
+            spans.push((left, right));
+        }
     }
-    if fraction >= 1.0 {
-        if let Some(last) = spans.last_mut() {
-            if last.1 < width {
-                last.1 = width;
-            }
+    spans
+}
+
+/// Full 8px blocks for a track. The first starts at 0 and the last ends at
+/// `width`. Spare pixels widen some gaps by one instead of widening a block.
+/// A track narrower than two blocks is one piece, because two 8px blocks
+/// would overlap.
+fn block_layout(width: i32) -> Vec<(i32, i32)> {
+    const CHUNK: i32 = 8;
+    if width < CHUNK * 2 {
+        return vec![(0, width)];
+    }
+    let count = ((width + 2) / 10).max(2);
+    let gaps = count - 1;
+    let gap_space = width - count * CHUNK;
+    let base = gap_space / gaps;
+    let extra = gap_space - base * gaps;
+    let mut spans = Vec::with_capacity(count as usize);
+    let mut x = 0;
+    for index in 0..count {
+        spans.push((x, x + CHUNK));
+        if index + 1 == count {
+            break;
         }
-        // A stub narrower than a block, sitting after a gap, reads as a gap at
-        // the edge. Pull it back into the previous block so that block ends
-        // on the inner edge.
-        if spans.len() >= 2 {
-            let short = spans.last().is_some_and(|(left, right)| right - left < CHUNK);
-            if short {
-                let end = spans.pop().map(|(_, right)| right).unwrap_or(width);
-                if let Some(prev) = spans.last_mut() {
-                    prev.1 = end;
-                }
-            }
-        }
+        let used = (index + 1) * extra / gaps;
+        let previous = index * extra / gaps;
+        x += CHUNK + base + if used > previous { 1 } else { 0 };
     }
     spans
 }
@@ -5317,22 +5320,37 @@ mod tests {
             assert!(!spans.is_empty(), "{width}");
             assert_eq!(spans[0].0, 0, "{width}");
             assert_eq!(spans.last().unwrap().1, width, "{width} {spans:?}");
-            let (left, right) = *spans.last().unwrap();
-            if width >= 8 {
-                assert!(right - left >= 8, "{width} last piece is a stub {spans:?}");
-            }
-            for pair in spans.windows(2) {
-                let gap = pair[1].0 - pair[0].1;
-                assert_eq!(gap, 2, "{width} gap {gap} in {spans:?}");
+            if width >= 16 {
+                for (left, right) in &spans {
+                    assert_eq!(right - left, 8, "{width} block is not 8px {spans:?}");
+                }
+                let mut gaps = Vec::new();
+                for pair in spans.windows(2) {
+                    let gap = pair[1].0 - pair[0].1;
+                    assert!(gap >= 0, "{width} overlap {spans:?}");
+                    gaps.push(gap);
+                }
+                if let (Some(min), Some(max)) = (gaps.iter().copied().min(), gaps.iter().copied().max()) {
+                    assert!(max - min <= 1, "{width} gaps {gaps:?}");
+                }
+                if width >= 18 {
+                    assert!(gaps.iter().all(|gap| *gap >= 2), "{width} {gaps:?}");
+                }
+                if width >= 100 {
+                    assert!(gaps.iter().all(|gap| *gap == 2 || *gap == 3), "{width} {gaps:?}");
+                }
+            } else {
+                assert_eq!(spans, vec![(0, width)], "{width}");
             }
         }
         // Still filling: stop on any pixel of a block, and leave the gaps white.
         assert_eq!(super::chunk_spans(100, 0.05), vec![(0, 5)]);
         assert_eq!(super::chunk_spans(100, 0.15), vec![(0, 8), (10, 15)]);
         assert_eq!(super::chunk_spans(16, 0.5), vec![(0, 8)]);
-        // Finished: the short end joins the block before it and meets the edge.
-        assert_eq!(super::chunk_spans(16, 1.0), vec![(0, 16)]);
+        // Finished: the last block is a normal 8px block on the right edge.
+        assert_eq!(super::chunk_spans(16, 1.0), vec![(0, 8), (8, 16)]);
         assert_eq!(super::chunk_spans(18, 1.0), vec![(0, 8), (10, 18)]);
+        assert_eq!(super::chunk_spans(19, 1.0), vec![(0, 8), (11, 19)]);
         assert!(super::chunk_spans(16, 0.0).is_empty());
         assert!(super::chunk_spans(0, 1.0).is_empty());
     }

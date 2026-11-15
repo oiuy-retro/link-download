@@ -29,3 +29,7 @@ Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/iss
 ## Download error cut off
 
 [#38](https://github.com/oiuy-retro/link-download/issues/38). An error on a download row is drawn only in the Download and Convert columns, and widening the window grows the File column, so the rest of the message stays cut off. This branch stops a short file name at the text and gives the rest of the row to the error.
+
+## Progress bar last block is too thick
+
+[#39](https://github.com/oiuy-retro/link-download/issues/39). At 100% the last navy block stretches to the right edge, so it is about twice as wide as the others and changes width with the window. This branch keeps every block 8 pixels wide. Spare pixels go into the gaps, and the last block still ends on the inner right edge.
