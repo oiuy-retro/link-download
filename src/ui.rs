@@ -293,6 +293,8 @@ struct App {
     media_stamp: Options,
     have_media: bool,
     download_done: bool,
+    /// Row ids that failed in the run that just finished. Empty when Retry is not offered.
+    misses: Vec<u64>,
     ytdlp: PathBuf,
     ffmpeg: PathBuf,
     node: PathBuf,
@@ -935,6 +937,7 @@ impl App {
             media_stamp: Options::default(),
             have_media: false,
             download_done: false,
+            misses: Vec::new(),
             ytdlp: PathBuf::new(),
             ffmpeg: PathBuf::new(),
             node: PathBuf::new(),
@@ -1682,10 +1685,15 @@ impl App {
             self.readout[index] = self.static_text(lx + label_w, ly, value_w, self.s(16), "—", false);
             set_id(self.readout[index], ID_READOUT + index as i32);
         }
-        if offer_start_over(self.download_done, self.busy == Busy::Idle) {
+        let caption = match done_button(self.download_done, self.busy == Busy::Idle, !self.misses.is_empty()) {
+            DoneButton::StartOver => "&Start over",
+            DoneButton::Retry => "&Retry",
+            DoneButton::None => "",
+        };
+        if !caption.is_empty() {
             // In the empty third column of the second row of readouts.
             let bw = self.s(75);
-            let button = self.button(w - self.s(8) - bw, y + self.s(18), bw, "&Start over", ID_START_OVER, false);
+            let button = self.button(w - self.s(8) - bw, y + self.s(18), bw, caption, ID_START_OVER, false);
             self.set_anchor(button, Anchor::Right);
         }
         y + self.s(40)
@@ -2171,7 +2179,11 @@ impl App {
             return Action::Browse;
         }
         if id == ID_START_OVER && code == 0 {
-            self.start_over();
+            if self.misses.is_empty() {
+                self.start_over();
+            } else {
+                self.retry_failed();
+            }
             return Action::None;
         }
         if id == ID_PROFILE && code == CBN_SELCHANGE as u16 {
@@ -2339,6 +2351,7 @@ impl App {
             return;
         }
         self.download_done = false;
+        self.misses.clear();
         self.fetch_ok = false;
         self.fetched_text.clear();
         self.have_media = false;
@@ -2347,6 +2360,19 @@ impl App {
         self.started = None;
         self.reset_speed();
         self.page = 0;
+        self.rebuild();
+    }
+
+    /// Download the links that failed again. Files that already saved are left
+    /// where they are. The fetched names stay, so this does not go back to Options.
+    fn retry_failed(&mut self) {
+        if self.busy != Busy::Idle || self.misses.is_empty() {
+            return;
+        }
+        run::release_for_retry(&mut self.groups, &self.misses);
+        self.misses.clear();
+        self.download_done = false;
+        self.spawn(Busy::Download);
         self.rebuild();
     }
 
@@ -3039,7 +3065,8 @@ impl App {
                 self.download_done = true;
                 self.have_media = true;
                 self.media_stamp = self.options.clone();
-                // Puts Start over on the page, then fills the status line, bar,
+                self.misses = live.misses.clone();
+                // Puts Start over or Retry on the page, then fills the status line, bar,
                 // and readouts back in.
                 self.rebuild();
                 self.paint_readouts(&live);
@@ -5043,10 +5070,23 @@ fn group_of(id: i32) -> usize {
     (id - base) as usize
 }
 
-/// Start over is offered once a download run has finished and the window is idle.
-/// A run that saved files counts the same as a run where every item failed.
-fn offer_start_over(download_done: bool, idle: bool) -> bool {
-    download_done && idle
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DoneButton {
+    None,
+    /// The run finished and every attempted file was saved.
+    StartOver,
+    /// Something failed. Download those links again.
+    Retry,
+}
+
+/// Start over is offered once a download run has finished and nothing failed.
+/// Retry is offered instead when a link did not download. Both stay hidden
+/// while the run is still going.
+fn done_button(download_done: bool, idle: bool, failed: bool) -> DoneButton {
+    if !(download_done && idle) {
+        return DoneButton::None;
+    }
+    if failed { DoneButton::Retry } else { DoneButton::StartOver }
 }
 
 fn button_bits(default: bool) -> u32 {
@@ -5213,10 +5253,11 @@ fn font_bits(font: HFONT) -> usize {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn start_over_is_offered_when_the_run_finishes() {
-        assert!(super::offer_start_over(true, true));
-        assert!(!super::offer_start_over(true, false));
-        assert!(!super::offer_start_over(false, true));
+    fn the_finished_run_button_retries_when_something_failed() {
+        assert_eq!(super::done_button(true, true, false), super::DoneButton::StartOver);
+        assert_eq!(super::done_button(true, true, true), super::DoneButton::Retry);
+        assert_eq!(super::done_button(true, false, true), super::DoneButton::None);
+        assert_eq!(super::done_button(false, true, true), super::DoneButton::None);
     }
 
     #[test]

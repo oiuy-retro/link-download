@@ -56,6 +56,8 @@ pub struct Live {
     pub error: String,
     /// Pauses still to run, in the order they will be waited. Rolled once at the start.
     pub waits: Vec<u32>,
+    /// Row ids that failed or were blocked during this run. Retry tries these again.
+    pub misses: Vec<u64>,
 }
 
 impl Live {
@@ -71,6 +73,7 @@ impl Live {
             done: false,
             error: String::new(),
             waits: Vec::new(),
+            misses: Vec::new(),
         }
     }
 }
@@ -1097,6 +1100,7 @@ fn pin(shared: &Shared, id: u64, note: &str, missing_or_age: bool) {
         let insert = live.rows.iter().position(|row| row.kind != RowKind::Pinned).unwrap_or(live.rows.len());
         live.rows.insert(insert, row);
         live.bad += 1;
+        remember_miss(&mut live, id);
     }
 }
 
@@ -1107,6 +1111,36 @@ fn fail(shared: &Shared, id: u64, note: &str) {
         row.note = note.to_string();
         live.bad += 1;
         live.status = note.to_string();
+        remember_miss(&mut live, id);
+    }
+}
+
+fn remember_miss(live: &mut Live, id: u64) {
+    if !live.misses.contains(&id) {
+        live.misses.push(id);
+    }
+}
+
+/// Clears the block on items this run failed to download, so Retry can try them
+/// again. A download that is still on disk, waiting to be converted, is kept.
+/// Items that are not in `misses` stay as they are, including videos that were
+/// already unavailable before the run.
+pub fn release_for_retry(groups: &mut [Group], misses: &[u64]) {
+    let missed: std::collections::HashSet<u64> = misses.iter().copied().collect();
+    if missed.is_empty() {
+        return;
+    }
+    for group in groups.iter_mut() {
+        for (index, item) in group.items.iter_mut().enumerate() {
+            if !missed.contains(&row_id_url(&group.source_url, index)) {
+                continue;
+            }
+            item.blocked = None;
+            let waiting = item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false);
+            if !waiting {
+                item.temp_path = None;
+            }
+        }
     }
 }
 
@@ -1403,5 +1437,93 @@ mod tests {
         );
         assert!(!json_only.error.contains("timedtext"), "{}", json_only.error);
         assert!(!json_only.error.contains("yt_dlp_client"), "{}", json_only.error);
+    }
+
+    fn queued(id: u64) -> WorkRow {
+        WorkRow {
+            id,
+            name: "Song".into(),
+            size: 0,
+            copied: 0,
+            fraction: 0.0,
+            convert: 0.0,
+            kind: RowKind::Queued,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_failed_download_is_remembered_for_retry() {
+        let shared = Shared::new();
+        shared.live.lock().expect("live").rows.push(queued(7));
+        fail(&shared, 7, "The download finished without a file.");
+        fail(&shared, 7, "The download finished without a file.");
+        let live = shared.live.lock().expect("live");
+        assert_eq!(live.misses, vec![7]);
+        assert_eq!(live.rows[0].kind, RowKind::Failed);
+    }
+
+    #[test]
+    fn an_age_block_during_the_run_is_remembered_for_retry() {
+        let shared = Shared::new();
+        shared.live.lock().expect("live").rows.push(queued(4));
+        pin(&shared, 4, "Age restricted", true);
+        let live = shared.live.lock().expect("live");
+        assert_eq!(live.misses, vec![4]);
+        assert_eq!(live.rows[0].kind, RowKind::Pinned);
+        assert_eq!(live.rows[0].note, "Age restricted");
+    }
+
+    fn plain_item(title: &str) -> crate::model::Item {
+        crate::model::Item {
+            id: title.into(),
+            title: title.into(),
+            meta_title: title.into(),
+            original_title: title.into(),
+            original_artists: Vec::new(),
+            artists: Vec::new(),
+            download_url: format!("https://example.test/{title}"),
+            playlist_item: None,
+            track_number: None,
+            duration: 0.0,
+            thumbnail: String::new(),
+            temp_path: None,
+            blocked: None,
+        }
+    }
+
+    #[test]
+    fn retry_clears_only_the_links_that_failed() {
+        let mut kept = plain_item("Kept");
+        kept.blocked = Some(Block::Missing);
+        let mut failed = plain_item("Failed");
+        failed.blocked = Some(Block::Age);
+        failed.temp_path = Some(std::env::temp_dir().join("link-download-no-such-retry-file").display().to_string());
+        let mut waiting = plain_item("Waiting");
+        let dir = std::env::temp_dir().join(format!("link-download-retry-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("waiting.bin");
+        fs::write(&file, b"x").unwrap();
+        waiting.temp_path = Some(file.display().to_string());
+        let mut groups = vec![Group {
+            source_url: "https://example.test/list".into(),
+            is_playlist: false,
+            playlist_title: String::new(),
+            album: String::new(),
+            original_album: String::new(),
+            playlist_thumbnail: String::new(),
+            error: String::new(),
+            items: vec![kept, failed, waiting],
+        }];
+        let failed_id = row_id_url(&groups[0].source_url, 1);
+        let waiting_id = row_id_url(&groups[0].source_url, 2);
+        release_for_retry(&mut groups, &[failed_id, waiting_id]);
+        assert_eq!(groups[0].items[0].blocked, Some(Block::Missing));
+        assert!(groups[0].items[1].blocked.is_none());
+        assert!(groups[0].items[1].temp_path.is_none());
+        assert!(groups[0].items[2].blocked.is_none());
+        assert_eq!(groups[0].items[2].temp_path.as_deref().map(Path::new), Some(file.as_path()));
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir(&dir);
     }
 }
