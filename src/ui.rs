@@ -3528,22 +3528,52 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
     chunks(hdc, convert, row.convert);
 }
 
+/// Navy blocks inside a track of `width` pixels, as `(left, right)` pairs.
+/// Blocks are 8 pixels with a 2 pixel gap. A finished bar also fills the leftover
+/// at the right edge. That leftover is a whole block on many widths, and leaving
+/// it white makes the last block look empty at 100%.
+fn chunk_spans(width: i32, fraction: f64) -> Vec<(i32, i32)> {
+    const CHUNK: i32 = 8;
+    const GAP: i32 = 2;
+    if width <= 0 {
+        return Vec::new();
+    }
+    let fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+    let slots = (width + GAP) / (CHUNK + GAP);
+    let filled = ((fraction * slots as f64).round() as i32).clamp(0, slots.max(0));
+    let mut spans = Vec::new();
+    for index in 0..filled {
+        let x = index * (CHUNK + GAP);
+        let right = (x + CHUNK).min(width);
+        if right > x {
+            spans.push((x, right));
+        }
+    }
+    if fraction >= 1.0 {
+        let end = spans.last().map(|(_, right)| *right).unwrap_or(0);
+        if end < width {
+            let x = if spans.is_empty() { 0 } else { end + GAP };
+            if x < width {
+                spans.push((x, width));
+            } else if let Some(last) = spans.last_mut() {
+                last.1 = width;
+            }
+        }
+    }
+    spans
+}
+
 fn chunks(hdc: HDC, mut outer: RECT, fraction: f64) {
     unsafe {
         let _ = DrawEdge(hdc, &mut outer, EDGE_SUNKEN, BF_RECT);
         let _ = InflateRect(&mut outer, -2, -2);
-        let chunk = 8;
-        let gap = 2;
         let width = outer.right - outer.left;
         if width <= 0 {
             return;
         }
-        let count = (width + gap) / (chunk + gap);
-        let filled = (fraction.clamp(0.0, 1.0) * count as f64).round() as i32;
         let navy = CreateSolidBrush(rgb(0, 0, 128));
-        for index in 0..filled.max(0) {
-            let x = outer.left + index * (chunk + gap);
-            let block = RECT { left: x, top: outer.top, right: (x + chunk).min(outer.right), bottom: outer.bottom };
+        for (left, right) in chunk_spans(width, fraction) {
+            let block = RECT { left: outer.left + left, top: outer.top, right: outer.left + right, bottom: outer.bottom };
             let _ = FillRect(hdc, &block, navy);
         }
         let _ = DeleteObject(navy);
@@ -5187,6 +5217,25 @@ mod tests {
         assert!(super::offer_start_over(true, true));
         assert!(!super::offer_start_over(true, false));
         assert!(!super::offer_start_over(false, true));
+    }
+
+    #[test]
+    fn a_finished_bar_fills_through_the_last_block() {
+        for width in 1..400 {
+            let spans = super::chunk_spans(width, 1.0);
+            assert!(!spans.is_empty(), "{width}");
+            assert_eq!(spans[0].0, 0, "{width}");
+            assert_eq!(spans.last().unwrap().1, width, "{width} {spans:?}");
+            for pair in spans.windows(2) {
+                let gap = pair[1].0 - pair[0].1;
+                assert!(gap == 0 || gap == 2, "{width} gap {gap} in {spans:?}");
+            }
+        }
+        // Width 16 holds one full block and an 8px leftover. That leftover is the
+        // empty last block. It stays empty until the bar is finished.
+        assert_eq!(super::chunk_spans(16, 0.5), vec![(0, 8)]);
+        assert_eq!(super::chunk_spans(16, 1.0), vec![(0, 8), (10, 16)]);
+        assert!(super::chunk_spans(16, 0.0).is_empty());
     }
 
     use super::*;
