@@ -1666,14 +1666,14 @@ impl App {
         self.percent_hwnd = self.static_text(w - self.s(58), y, self.s(50), self.s(16), "0%", false);
         set_id(self.percent_hwnd, ID_PERCENT);
         y += self.s(22);
-        let labels = ["Speed", "Items per second", "Files left", "Time left", "Elapsed"];
+        let labels = ["Speed", "Items per minute", "Files left", "Time left", "Elapsed"];
         let col_w = ((w - self.s(16)) / 3).max(self.s(160));
         for (index, label) in labels.iter().enumerate() {
             let col = (index % 3) as i32;
             let row = (index / 3) as i32;
             let lx = self.s(8) + col * col_w;
             let ly = y + row * self.s(18);
-            // Time left and Elapsed need room for 01D:05H:10M:00S / Calculating...
+            // Time left needs room for 01D:05H:10M. Elapsed still shows seconds. Calculating... is wider.
             let timer = index == 3 || index == 4;
             let label_w = if timer {
                 self.s(72)
@@ -3192,7 +3192,7 @@ impl App {
         let elapsed = self.started.map(|start| readout::format_elapsed(start.elapsed().as_secs())).unwrap_or_else(|| "0:00".into());
         let values = [
             readout::format_rate(speed),
-            readout::format_items(items),
+            readout::format_items(readout::per_minute(items)),
             left.to_string(),
             eta.to_string(),
             elapsed,

@@ -13,3 +13,7 @@ Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/iss
 ## Retry failed downloads
 
 [#34](https://github.com/oiuy-retro/link-download/issues/34). When a download run finishes with errors, Start over returns to Options and drops the fetched names. This branch shows Retry instead and downloads only the links that failed.
+
+## Time left seconds and items per second
+
+[#35](https://github.com/oiuy-retro/link-download/issues/35). Time left includes seconds, and the item rate is per second, so both numbers jump. This branch shows Time left in days, hours, and minutes, and counts items per minute.
