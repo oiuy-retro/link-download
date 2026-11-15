@@ -1,4 +1,4 @@
-//! The same readouts as Folder Difference Copy: speed, items per second, files left, time left, elapsed.
+//! Download page readouts: speed, items per minute, files left, time left, elapsed.
 
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -40,24 +40,33 @@ fn format_scaled(bytes: f64) -> String {
     format!("{number} {}", units[unit])
 }
 
-pub fn format_items(per_second: f64) -> String {
-    let per_second = if per_second.is_finite() && per_second > 0.0 { per_second } else { 0.0 };
-    if per_second >= 100.0 {
-        format!("{per_second:.0}")
-    } else if per_second >= 10.0 {
-        format!("{per_second:.1}")
+pub fn format_items(per_minute: f64) -> String {
+    let per_minute = if per_minute.is_finite() && per_minute > 0.0 { per_minute } else { 0.0 };
+    if per_minute >= 100.0 {
+        format!("{per_minute:.0}")
+    } else if per_minute >= 10.0 {
+        format!("{per_minute:.1}")
     } else {
-        format!("{per_second:.2}")
+        format!("{per_minute:.2}")
     }
 }
 
-/// Time left with a unit on every field: 12D:05H:05M:04S. Leading units that are
-/// zero are left out (01H:05M:04S, 05M:04S), but minutes and seconds always show.
+/// Items finished per minute. A run shorter than one minute is not stretched
+/// into a full minute of that pace: one item in ten seconds is 1, not 6.
+pub fn items_per_minute(finished: f64, elapsed_seconds: f64) -> f64 {
+    let finished = if finished.is_finite() && finished > 0.0 { finished } else { return 0.0 };
+    let elapsed = if elapsed_seconds.is_finite() && elapsed_seconds > 0.0 { elapsed_seconds } else { 0.0 };
+    finished / (elapsed / 60.0).max(1.0)
+}
+
+/// Time left with a unit on every field, seconds included: 12D:05H:05M:04S.
+/// Leading units that are zero are left out (01H:05M:00S, 05M:04S), but
+/// minutes and seconds always show.
 pub fn format_eta(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "Calculating...".into();
     }
-    let total = seconds.round() as u64;
+    let total = seconds.round().max(0.0) as u64;
     let days = total / 86_400;
     let hours = (total % 86_400) / 3_600;
     let minutes = (total % 3_600) / 60;
@@ -369,6 +378,13 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.50 KB");
         assert_eq!(format_rate(2048.0), "2.00 KB/s");
         assert_eq!(format_items(1.2), "1.20");
+        assert_eq!(items_per_minute(0.0, 10.0), 0.0);
+        assert_eq!(items_per_minute(1.0, 10.0), 1.0);
+        assert_eq!(format_items(items_per_minute(1.0, 10.0)), "1.00");
+        assert_eq!(items_per_minute(1.0, 120.0), 0.5);
+        assert_eq!(items_per_minute(3.0, 90.0), 2.0);
+        assert_eq!(items_per_minute(2.0, 30.0), 2.0);
+        assert_eq!(format_items(items_per_minute(f64::NAN, 10.0)), "0.00");
         assert_eq!(format_elapsed(75), "1:15");
         assert_eq!(format_elapsed(3661), "1:01:01");
         assert_eq!(percent(0.999), 99);

@@ -293,6 +293,8 @@ struct App {
     media_stamp: Options,
     have_media: bool,
     download_done: bool,
+    /// Row ids that failed in the run that just finished. Empty when Retry is not offered.
+    misses: Vec<u64>,
     ytdlp: PathBuf,
     ffmpeg: PathBuf,
     node: PathBuf,
@@ -491,8 +493,7 @@ fn frame_style() -> windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE {
 }
 
 fn minimum_window() -> (i32, i32) {
-    let dpi = screen_dpi();
-    (scale(640, dpi), scale(480, dpi))
+    opening_client(screen_dpi())
 }
 
 fn create_main(instance: HINSTANCE) -> HWND {
@@ -935,6 +936,7 @@ impl App {
             media_stamp: Options::default(),
             have_media: false,
             download_done: false,
+            misses: Vec::new(),
             ytdlp: PathBuf::new(),
             ffmpeg: PathBuf::new(),
             node: PathBuf::new(),
@@ -1663,14 +1665,14 @@ impl App {
         self.percent_hwnd = self.static_text(w - self.s(58), y, self.s(50), self.s(16), "0%", false);
         set_id(self.percent_hwnd, ID_PERCENT);
         y += self.s(22);
-        let labels = ["Speed", "Items per second", "Files left", "Time left", "Elapsed"];
+        let labels = ["Speed", "Items per minute", "Files left", "Time left", "Elapsed"];
         let col_w = ((w - self.s(16)) / 3).max(self.s(160));
         for (index, label) in labels.iter().enumerate() {
             let col = (index % 3) as i32;
             let row = (index / 3) as i32;
             let lx = self.s(8) + col * col_w;
             let ly = y + row * self.s(18);
-            // Time left and Elapsed need room for 01D:05H:10M:00S / Calculating...
+            // Time left and Elapsed need room for 01D:05H:10M:00S. Calculating... is wider.
             let timer = index == 3 || index == 4;
             let label_w = if timer {
                 self.s(72)
@@ -1682,10 +1684,15 @@ impl App {
             self.readout[index] = self.static_text(lx + label_w, ly, value_w, self.s(16), "—", false);
             set_id(self.readout[index], ID_READOUT + index as i32);
         }
-        if offer_start_over(self.download_done, self.busy == Busy::Idle) {
+        let caption = match done_button(self.download_done, self.busy == Busy::Idle, !self.misses.is_empty()) {
+            DoneButton::StartOver => "&Start over",
+            DoneButton::Retry => "&Retry",
+            DoneButton::None => "",
+        };
+        if !caption.is_empty() {
             // In the empty third column of the second row of readouts.
             let bw = self.s(75);
-            let button = self.button(w - self.s(8) - bw, y + self.s(18), bw, "&Start over", ID_START_OVER, false);
+            let button = self.button(w - self.s(8) - bw, y + self.s(18), bw, caption, ID_START_OVER, false);
             self.set_anchor(button, Anchor::Right);
         }
         y + self.s(40)
@@ -1910,8 +1917,11 @@ impl App {
         let boxes = layout_page(&specs, host_w, view_h);
         // Positions are on the sheet. Scrolling moves the sheet, not each control.
         for (kid, (x, y, w, h)) in self.kids.iter().zip(boxes) {
-            unsafe { let _ = MoveWindow(kid.hwnd, x, y, w, h, false); }
             let class = class_name(kid.hwnd);
+            // A progress bar is a little shorter than its slot when the slot is
+            // not an exact run of blocks, so the gaps stay equal.
+            let width = if class == "LinkProgressBar" { bar_outer(w).max(1) } else { w };
+            unsafe { let _ = MoveWindow(kid.hwnd, x, y, width, h, false); }
             if class == "SysListView32" {
                 // LVM_SETCOLUMNWIDTH. Fit the column to the inside of the list, so a guessed
                 // width can never be wider than the list and add a sideways scroll bar.
@@ -2171,7 +2181,11 @@ impl App {
             return Action::Browse;
         }
         if id == ID_START_OVER && code == 0 {
-            self.start_over();
+            if self.misses.is_empty() {
+                self.start_over();
+            } else {
+                self.retry_failed();
+            }
             return Action::None;
         }
         if id == ID_PROFILE && code == CBN_SELCHANGE as u16 {
@@ -2339,6 +2353,7 @@ impl App {
             return;
         }
         self.download_done = false;
+        self.misses.clear();
         self.fetch_ok = false;
         self.fetched_text.clear();
         self.have_media = false;
@@ -2347,6 +2362,19 @@ impl App {
         self.started = None;
         self.reset_speed();
         self.page = 0;
+        self.rebuild();
+    }
+
+    /// Download the links that failed again. Files that already saved are left
+    /// where they are. The fetched names stay, so this does not go back to Options.
+    fn retry_failed(&mut self) {
+        if self.busy != Busy::Idle || self.misses.is_empty() {
+            return;
+        }
+        run::release_for_retry(&mut self.groups, &self.misses);
+        self.misses.clear();
+        self.download_done = false;
+        self.spawn(Busy::Download);
         self.rebuild();
     }
 
@@ -3039,7 +3067,8 @@ impl App {
                 self.download_done = true;
                 self.have_media = true;
                 self.media_stamp = self.options.clone();
-                // Puts Start over on the page, then fills the status line, bar,
+                self.misses = live.misses.clone();
+                // Puts Start over or Retry on the page, then fills the status line, bar,
                 // and readouts back in.
                 self.rebuild();
                 self.paint_readouts(&live);
@@ -3332,9 +3361,9 @@ fn planned_bytes(live: &Live) -> Option<f64> {
 
 fn speed_of(app: &App) -> (f64, f64) {
     let speed = app.rate.rate().unwrap_or(0.0);
-    // Whole run, waits included, so it agrees with Time left.
-    let run = app.sample_start.elapsed().as_secs_f64().max(0.25);
-    let items = app.finished as f64 / run;
+    // Whole run, waits included. A run under a minute is not scaled up.
+    let elapsed = app.sample_start.elapsed().as_secs_f64();
+    let items = readout::items_per_minute(app.finished as f64, elapsed);
     (speed, items)
 }
 
@@ -3497,6 +3526,12 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, rgb(0, 0, 0));
     }
+    let name_w = if !row.note.is_empty() && row.kind != RowKind::Active {
+        let units: Vec<u16> = row.name.encode_utf16().collect();
+        note_name_width(name_w, text_width(hdc, &units))
+    } else {
+        name_w
+    };
     text_in(hdc, &row.name, RECT { left: rect.left + 6, top: rect.top, right: rect.left + name_w - 4, bottom: rect.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     let size = if row.size > 0 { readout::format_bytes(row.size) } else { String::new() };
     text_in(hdc, &size, RECT { left: rect.left + name_w, top: rect.top, right: rect.left + name_w + size_w - 6, bottom: rect.bottom }, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -3512,15 +3547,15 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
     let bar_h = ((rect.bottom - rect.top) - 6).clamp(8, 14);
     let top = rect.top + (rect.bottom - rect.top - bar_h) / 2;
     let download = RECT {
-        left: rect.left + name_w + size_w + 6,
+        left: rect.left + name_w + size_w + BAR_BEFORE,
         top,
-        right: rect.left + name_w + size_w + download_w - 8,
+        right: rect.left + name_w + size_w + download_w - BAR_AFTER,
         bottom: top + bar_h,
     };
     let convert = RECT {
-        left: rect.left + name_w + size_w + download_w + 6,
+        left: rect.left + name_w + size_w + download_w + BAR_BEFORE,
         top,
-        right: rect.left + name_w + size_w + download_w + convert_w - 8,
+        right: rect.left + name_w + size_w + download_w + convert_w - BAR_AFTER,
         bottom: top + bar_h,
     };
     let download_fraction = if row.kind == RowKind::Pinned { 0.0 } else { row.fraction };
@@ -3528,29 +3563,125 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
     chunks(hdc, convert, row.convert);
 }
 
+/// Pixels of a bar column before the sunken bar, and after it.
+const BAR_BEFORE: i32 = 6;
+const BAR_AFTER: i32 = 8;
+const BAR_CHUNK: i32 = 8;
+const BAR_GAP: i32 = 2;
+/// DrawEdge inset. The sunken border is this thick on every side.
+const BAR_BORDER: i32 = 2;
+/// The work list's sunken edge, in pixels. It does not follow `scale`.
+const LIST_EDGE: i32 = 2;
+
+/// Outer width of a sunken bar that holds whole blocks and equal gaps.
+/// The largest `10N + 2` that fits in `outer`. A bar that is too narrow for
+/// one block is left as it is.
+fn bar_outer(outer: i32) -> i32 {
+    if outer <= BAR_BORDER * 2 {
+        return outer.max(0);
+    }
+    let inner = outer - BAR_BORDER * 2;
+    let count = (inner + BAR_GAP) / (BAR_CHUNK + BAR_GAP);
+    if count < 1 {
+        return outer;
+    }
+    count * (BAR_CHUNK + BAR_GAP) - BAR_GAP + BAR_BORDER * 2
+}
+
+/// Navy blocks inside a track of `width` pixels, as `(left, right)` pairs.
+/// Blocks are 8 pixels and gaps are 2. While the bar is still filling, the
+/// last block may stop on any pixel of its 8. The track width is chosen so a
+/// finished bar ends on a block, so a short stub is not painted.
+fn chunk_spans(width: i32, fraction: f64) -> Vec<(i32, i32)> {
+    if width <= 0 {
+        return Vec::new();
+    }
+    let fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+    if fraction <= 0.0 {
+        return Vec::new();
+    }
+    // Stay short of the edge until the bar is actually finished.
+    let filled = if fraction >= 1.0 {
+        width
+    } else {
+        let px = (fraction * width as f64).round() as i32;
+        px.clamp(0, width - 1)
+    };
+    if filled <= 0 {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut x = 0;
+    while x < width {
+        let block_right = x + BAR_CHUNK;
+        if fraction >= 1.0 {
+            if block_right > width {
+                break;
+            }
+            spans.push((x, block_right));
+        } else {
+            if x >= filled {
+                break;
+            }
+            let right = block_right.min(filled);
+            if right > x {
+                spans.push((x, right));
+            }
+        }
+        x = block_right + BAR_GAP;
+    }
+    spans
+}
+
 fn chunks(hdc: HDC, mut outer: RECT, fraction: f64) {
     unsafe {
+        let snapped = bar_outer(outer.right - outer.left);
+        outer.right = outer.left + snapped;
         let _ = DrawEdge(hdc, &mut outer, EDGE_SUNKEN, BF_RECT);
-        let _ = InflateRect(&mut outer, -2, -2);
-        let chunk = 8;
-        let gap = 2;
+        let _ = InflateRect(&mut outer, -BAR_BORDER, -BAR_BORDER);
         let width = outer.right - outer.left;
         if width <= 0 {
             return;
         }
-        let count = (width + gap) / (chunk + gap);
-        let filled = (fraction.clamp(0.0, 1.0) * count as f64).round() as i32;
         let navy = CreateSolidBrush(rgb(0, 0, 128));
-        for index in 0..filled.max(0) {
-            let x = outer.left + index * (chunk + gap);
-            let block = RECT { left: x, top: outer.top, right: (x + chunk).min(outer.right), bottom: outer.bottom };
+        for (left, right) in chunk_spans(width, fraction) {
+            let block = RECT { left: outer.left + left, top: outer.top, right: outer.left + right, bottom: outer.bottom };
             let _ = FillRect(hdc, &block, navy);
         }
         let _ = DeleteObject(navy);
     }
 }
 
+/// File-column width when the row shows an error instead of the two bars.
+/// The measured name stops the column, so spare width in that column becomes
+/// part of the error. Widening the window then reveals more of the message.
+/// A long name still stops at the header's File column.
+fn note_name_width(name_column: i32, name_px: i32) -> i32 {
+    // 6px before the name, 4px before the size, plus 2px so DrawText does not
+    // ellipsize a name that was measured to fit.
+    const PAD: i32 = 12;
+    const MIN_NAME: i32 = 48;
+    if name_column <= 0 {
+        return 0;
+    }
+    let fitted = name_px.max(0).saturating_add(PAD);
+    let floor = MIN_NAME.min(name_column);
+    fitted.clamp(floor, name_column)
+}
+
 fn columns(width: i32) -> (i32, i32, i32, i32) {
+    let (name, size, bar, _) = column_split(width);
+    let inset = BAR_BEFORE + BAR_AFTER;
+    let fitted = bar_outer((bar - inset).max(0)) + inset;
+    if fitted > inset && fitted < bar {
+        let spare = (bar - fitted) * 2;
+        return (name + spare, size, fitted, fitted);
+    }
+    (name, size, bar, bar)
+}
+
+/// File, size, and bar columns before the bar width is snapped to whole blocks.
+fn column_split(width: i32) -> (i32, i32, i32, i32) {
     let mut bar = (width / 5).clamp(72, 160);
     let mut size = (width / 8).clamp(52, 80);
     let mut name = width - bar * 2 - size;
@@ -3560,6 +3691,49 @@ fn columns(width: i32) -> (i32, i32, i32, i32) {
         name = (width - bar * 2 - size).max(40);
     }
     (name, size, bar, bar)
+}
+
+/// Client size the window opens at. Near 640 by 480. Prefer a width where the
+/// bottom bar and the row bars are already an exact run of blocks. When scale
+/// rounding makes that a long way off, keep the bottom bar exact and let the
+/// row bars take the few pixels they need.
+fn opening_client(dpi: i32) -> (i32, i32) {
+    let want = scale(640, dpi);
+    let height = scale(480, dpi);
+    let border = scale(3, dpi);
+    let low = (want - 400).max(border * 2 + 200);
+    let high = want + 400;
+    let mut both: Option<i32> = None;
+    let mut both_dist = i32::MAX;
+    let mut progress_only = want;
+    let mut progress_dist = i32::MAX;
+    for client in low..high {
+        let host = client - 2 * border;
+        let progress = host - scale(70, dpi);
+        if progress <= 0 || bar_outer(progress) != progress {
+            continue;
+        }
+        let dist = (client - want).abs();
+        if dist < progress_dist {
+            progress_dist = dist;
+            progress_only = client;
+        }
+        let list = host - scale(16, dpi) - LIST_EDGE;
+        if list <= 0 {
+            continue;
+        }
+        let (_, _, bar, _) = column_split(list);
+        let painted = bar - (BAR_BEFORE + BAR_AFTER);
+        if painted > 0 && bar_outer(painted) == painted && dist < both_dist {
+            both_dist = dist;
+            both = Some(client);
+        }
+    }
+    let client = match both {
+        Some(client) if both_dist <= 40 => client,
+        _ => progress_only,
+    };
+    (client, height)
 }
 
 fn text_in(hdc: HDC, text: &str, mut rect: RECT, format: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT) {
@@ -5013,10 +5187,23 @@ fn group_of(id: i32) -> usize {
     (id - base) as usize
 }
 
-/// Start over is offered once a download run has finished and the window is idle.
-/// A run that saved files counts the same as a run where every item failed.
-fn offer_start_over(download_done: bool, idle: bool) -> bool {
-    download_done && idle
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DoneButton {
+    None,
+    /// The run finished and every attempted file was saved.
+    StartOver,
+    /// Something failed. Download those links again.
+    Retry,
+}
+
+/// Start over is offered once a download run has finished and nothing failed.
+/// Retry is offered instead when a link did not download. Both stay hidden
+/// while the run is still going.
+fn done_button(download_done: bool, idle: bool, failed: bool) -> DoneButton {
+    if !(download_done && idle) {
+        return DoneButton::None;
+    }
+    if failed { DoneButton::Retry } else { DoneButton::StartOver }
 }
 
 fn button_bits(default: bool) -> u32 {
@@ -5183,10 +5370,73 @@ fn font_bits(font: HFONT) -> usize {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn start_over_is_offered_when_the_run_finishes() {
-        assert!(super::offer_start_over(true, true));
-        assert!(!super::offer_start_over(true, false));
-        assert!(!super::offer_start_over(false, true));
+    fn the_finished_run_button_retries_when_something_failed() {
+        assert_eq!(super::done_button(true, true, false), super::DoneButton::StartOver);
+        assert_eq!(super::done_button(true, true, true), super::DoneButton::Retry);
+        assert_eq!(super::done_button(true, false, true), super::DoneButton::None);
+        assert_eq!(super::done_button(false, true, true), super::DoneButton::None);
+    }
+
+    #[test]
+    fn a_finished_bar_meets_the_right_edge() {
+        for outer in 12..500 {
+            let snapped = super::bar_outer(outer);
+            assert!(snapped <= outer, "{outer} grew to {snapped}");
+            assert_eq!(super::bar_outer(snapped), snapped, "{snapped}");
+            let inner = snapped - 4;
+            let spans = super::chunk_spans(inner, 1.0);
+            assert!(!spans.is_empty(), "{outer}");
+            assert_eq!(spans[0].0, 0, "{inner}");
+            assert_eq!(spans.last().unwrap().1, inner, "{inner} {spans:?}");
+            for (left, right) in &spans {
+                assert_eq!(right - left, 8, "{inner} {spans:?}");
+            }
+            for pair in spans.windows(2) {
+                assert_eq!(pair[1].0 - pair[0].1, 2, "{inner} {spans:?}");
+            }
+        }
+        // Still filling: stop on any pixel of a block, and leave the gaps white.
+        assert_eq!(super::chunk_spans(100, 0.05), vec![(0, 5)]);
+        assert_eq!(super::chunk_spans(100, 0.15), vec![(0, 8), (10, 15)]);
+        assert_eq!(super::chunk_spans(16, 0.5), vec![(0, 8)]);
+        assert_eq!(super::chunk_spans(18, 1.0), vec![(0, 8), (10, 18)]);
+        assert!(super::chunk_spans(16, 0.0).is_empty());
+        assert!(super::chunk_spans(0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn the_window_opens_at_a_size_the_bars_fill() {
+        for dpi in [96, 120, 144] {
+            let (client, height) = super::opening_client(dpi);
+            assert_eq!(height, super::scale(480, dpi), "{dpi}");
+            let border = super::scale(3, dpi);
+            let host = client - 2 * border;
+            let progress = host - super::scale(70, dpi);
+            assert_eq!(super::bar_outer(progress), progress, "dpi {dpi} client {client}");
+            let list = host - super::scale(16, dpi) - super::LIST_EDGE;
+            let (_, _, bar, convert) = super::columns(list);
+            assert_eq!(bar, convert);
+            let painted = bar - (super::BAR_BEFORE + super::BAR_AFTER);
+            assert_eq!(super::bar_outer(painted), painted, "dpi {dpi} list {list} bar {bar}");
+            let want = super::scale(640, dpi);
+            assert!((client - want).abs() <= 40, "dpi {dpi} opened at {client}, wanted near {want}");
+        }
+        assert_eq!(super::opening_client(96).0, 658);
+    }
+
+    #[test]
+    fn a_short_name_leaves_the_row_for_the_error() {
+        assert_eq!(super::note_name_width(400, 60), 72);
+        assert_eq!(super::note_name_width(400, 500), 400);
+        assert_eq!(super::note_name_width(400, 0), 48);
+        assert_eq!(super::note_name_width(40, 0), 40);
+        assert_eq!(super::note_name_width(400, 36), 48);
+        assert_eq!(super::note_name_width(0, 10), 0);
+        // Growing the window grows the File column. A short name stays put,
+        // so the extra width is the error's.
+        let narrow = super::note_name_width(300, 60);
+        let wide = super::note_name_width(800, 60);
+        assert_eq!(narrow, wide);
     }
 
     use super::*;
