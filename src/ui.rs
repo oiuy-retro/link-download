@@ -3524,6 +3524,12 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, rgb(0, 0, 0));
     }
+    let name_w = if !row.note.is_empty() && row.kind != RowKind::Active {
+        let units: Vec<u16> = row.name.encode_utf16().collect();
+        note_name_width(name_w, text_width(hdc, &units))
+    } else {
+        name_w
+    };
     text_in(hdc, &row.name, RECT { left: rect.left + 6, top: rect.top, right: rect.left + name_w - 4, bottom: rect.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     let size = if row.size > 0 { readout::format_bytes(row.size) } else { String::new() };
     text_in(hdc, &size, RECT { left: rect.left + name_w, top: rect.top, right: rect.left + name_w + size_w - 6, bottom: rect.bottom }, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -3632,6 +3638,23 @@ fn chunks(hdc: HDC, mut outer: RECT, fraction: f64) {
         }
         let _ = DeleteObject(navy);
     }
+}
+
+/// File-column width when the row shows an error instead of the two bars.
+/// The measured name stops the column, so spare width in that column becomes
+/// part of the error. Widening the window then reveals more of the message.
+/// A long name still stops at the header's File column.
+fn note_name_width(name_column: i32, name_px: i32) -> i32 {
+    // 6px before the name, 4px before the size, plus 2px so DrawText does not
+    // ellipsize a name that was measured to fit.
+    const PAD: i32 = 12;
+    const MIN_NAME: i32 = 48;
+    if name_column <= 0 {
+        return 0;
+    }
+    let fitted = name_px.max(0).saturating_add(PAD);
+    let floor = MIN_NAME.min(name_column);
+    fitted.clamp(floor, name_column)
 }
 
 fn columns(width: i32) -> (i32, i32, i32, i32) {
@@ -5312,6 +5335,21 @@ mod tests {
         assert_eq!(super::chunk_spans(18, 1.0), vec![(0, 8), (10, 18)]);
         assert!(super::chunk_spans(16, 0.0).is_empty());
         assert!(super::chunk_spans(0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn a_short_name_leaves_the_row_for_the_error() {
+        assert_eq!(super::note_name_width(400, 60), 72);
+        assert_eq!(super::note_name_width(400, 500), 400);
+        assert_eq!(super::note_name_width(400, 0), 48);
+        assert_eq!(super::note_name_width(40, 0), 40);
+        assert_eq!(super::note_name_width(400, 36), 48);
+        assert_eq!(super::note_name_width(0, 10), 0);
+        // Growing the window grows the File column. A short name stays put,
+        // so the extra width is the error's.
+        let narrow = super::note_name_width(300, 60);
+        let wide = super::note_name_width(800, 60);
+        assert_eq!(narrow, wide);
     }
 
     use super::*;

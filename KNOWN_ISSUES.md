@@ -25,3 +25,7 @@ Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/iss
 ## Items per minute on a short run
 
 [#37](https://github.com/oiuy-retro/link-download/issues/37). One finished item in about ten seconds shows as 5.77 items per minute, because that one item is stretched out to a full minute. This branch does not stretch a run that is shorter than a minute, so one item shows as 1.
+
+## Download error cut off
+
+[#38](https://github.com/oiuy-retro/link-download/issues/38). An error on a download row is drawn only in the Download and Convert columns, and widening the window grows the File column, so the rest of the message stays cut off. This branch stops a short file name at the text and gives the rest of the row to the error.
