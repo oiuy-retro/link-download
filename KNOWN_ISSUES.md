@@ -33,3 +33,7 @@ Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/iss
 ## Progress bar last block is too thick
 
 [#39](https://github.com/oiuy-retro/link-download/issues/39). At 100% the last navy block stretches to the right edge, so it is about twice as wide as the others and changes width with the window. This branch keeps every block 8 pixels wide. Spare pixels go into the gaps, and the last block still ends on the inner right edge.
+
+## Progress bar gaps are uneven
+
+[#40](https://github.com/oiuy-retro/link-download/issues/40). The gaps between the navy blocks are not all the same width. This branch keeps every block at 8 pixels and every gap at 2. The bar is a little shorter when the width is not an exact fit. The window opens at a size where the bottom bar and the row bars already fit.
