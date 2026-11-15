@@ -17,3 +17,7 @@ Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/iss
 ## Time left seconds and items per second
 
 [#35](https://github.com/oiuy-retro/link-download/issues/35). Time left includes seconds, and the item rate is per second, so both numbers jump. This branch shows Time left in days, hours, and minutes, and counts items per minute.
+
+## Progress bar right edge
+
+[#36](https://github.com/oiuy-retro/link-download/issues/36). At 100% the last navy piece is a short stub after a gap, so it does not meet the right edge. This branch joins that stub to the block before it. While the bar is still filling, it may stop partway through a block.

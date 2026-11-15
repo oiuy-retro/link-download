@@ -3556,9 +3556,10 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
 }
 
 /// Navy blocks inside a track of `width` pixels, as `(left, right)` pairs.
-/// Blocks are 8 pixels with a 2 pixel gap. A finished bar also fills the leftover
-/// at the right edge. That leftover is a whole block on many widths, and leaving
-/// it white makes the last block look empty at 100%.
+/// Blocks are 8 pixels with a 2 pixel gap. While the bar is still filling, the
+/// last block may stop on any pixel of that 8. At 100% the last solid piece
+/// meets the right edge. A short stub after a gap is joined onto the block
+/// before it, so the finished bar does not end as a sliver.
 fn chunk_spans(width: i32, fraction: f64) -> Vec<(i32, i32)> {
     const CHUNK: i32 = 8;
     const GAP: i32 = 2;
@@ -3566,24 +3567,50 @@ fn chunk_spans(width: i32, fraction: f64) -> Vec<(i32, i32)> {
         return Vec::new();
     }
     let fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
-    let slots = (width + GAP) / (CHUNK + GAP);
-    let filled = ((fraction * slots as f64).round() as i32).clamp(0, slots.max(0));
+    if fraction <= 0.0 {
+        return Vec::new();
+    }
+    // Stay short of the edge until the bar is actually finished. Rounding a
+    // fraction such as 0.999 must not paint the last pixel early.
+    let filled = if fraction >= 1.0 {
+        width
+    } else {
+        let px = (fraction * width as f64).round() as i32;
+        px.clamp(0, width - 1)
+    };
+    if filled <= 0 {
+        return Vec::new();
+    }
     let mut spans = Vec::new();
-    for index in 0..filled {
-        let x = index * (CHUNK + GAP);
-        let right = (x + CHUNK).min(width);
+    let mut x = 0;
+    while x < filled {
+        let block_right = (x + CHUNK).min(width);
+        let right = block_right.min(filled);
         if right > x {
             spans.push((x, right));
         }
+        let next = block_right + GAP;
+        if next <= x {
+            break;
+        }
+        x = next;
     }
     if fraction >= 1.0 {
-        let end = spans.last().map(|(_, right)| *right).unwrap_or(0);
-        if end < width {
-            let x = if spans.is_empty() { 0 } else { end + GAP };
-            if x < width {
-                spans.push((x, width));
-            } else if let Some(last) = spans.last_mut() {
+        if let Some(last) = spans.last_mut() {
+            if last.1 < width {
                 last.1 = width;
+            }
+        }
+        // A stub narrower than a block, sitting after a gap, reads as a gap at
+        // the edge. Pull it back into the previous block so that block ends
+        // on the inner edge.
+        if spans.len() >= 2 {
+            let short = spans.last().is_some_and(|(left, right)| right - left < CHUNK);
+            if short {
+                let end = spans.pop().map(|(_, right)| right).unwrap_or(width);
+                if let Some(prev) = spans.last_mut() {
+                    prev.1 = end;
+                }
             }
         }
     }
@@ -5261,22 +5288,30 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_bar_fills_through_the_last_block() {
+    fn a_finished_bar_meets_the_right_edge() {
         for width in 1..400 {
             let spans = super::chunk_spans(width, 1.0);
             assert!(!spans.is_empty(), "{width}");
             assert_eq!(spans[0].0, 0, "{width}");
             assert_eq!(spans.last().unwrap().1, width, "{width} {spans:?}");
+            let (left, right) = *spans.last().unwrap();
+            if width >= 8 {
+                assert!(right - left >= 8, "{width} last piece is a stub {spans:?}");
+            }
             for pair in spans.windows(2) {
                 let gap = pair[1].0 - pair[0].1;
-                assert!(gap == 0 || gap == 2, "{width} gap {gap} in {spans:?}");
+                assert_eq!(gap, 2, "{width} gap {gap} in {spans:?}");
             }
         }
-        // Width 16 holds one full block and an 8px leftover. That leftover is the
-        // empty last block. It stays empty until the bar is finished.
+        // Still filling: stop on any pixel of a block, and leave the gaps white.
+        assert_eq!(super::chunk_spans(100, 0.05), vec![(0, 5)]);
+        assert_eq!(super::chunk_spans(100, 0.15), vec![(0, 8), (10, 15)]);
         assert_eq!(super::chunk_spans(16, 0.5), vec![(0, 8)]);
-        assert_eq!(super::chunk_spans(16, 1.0), vec![(0, 8), (10, 16)]);
+        // Finished: the short end joins the block before it and meets the edge.
+        assert_eq!(super::chunk_spans(16, 1.0), vec![(0, 16)]);
+        assert_eq!(super::chunk_spans(18, 1.0), vec![(0, 8), (10, 18)]);
         assert!(super::chunk_spans(16, 0.0).is_empty());
+        assert!(super::chunk_spans(0, 1.0).is_empty());
     }
 
     use super::*;
