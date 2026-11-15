@@ -51,10 +51,12 @@ pub fn format_items(per_minute: f64) -> String {
     }
 }
 
-/// Items finished per minute. The run tracks items per second; the readout does not.
-pub fn per_minute(per_second: f64) -> f64 {
-    let per_second = if per_second.is_finite() && per_second > 0.0 { per_second } else { 0.0 };
-    per_second * 60.0
+/// Items finished per minute. A run shorter than one minute is not stretched
+/// into a full minute of that pace: one item in ten seconds is 1, not 6.
+pub fn items_per_minute(finished: f64, elapsed_seconds: f64) -> f64 {
+    let finished = if finished.is_finite() && finished > 0.0 { finished } else { return 0.0 };
+    let elapsed = if elapsed_seconds.is_finite() && elapsed_seconds > 0.0 { elapsed_seconds } else { 0.0 };
+    finished / (elapsed / 60.0).max(1.0)
 }
 
 /// Time left with a unit on every field, and no seconds: 12D:05H:05M.
@@ -375,9 +377,13 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.50 KB");
         assert_eq!(format_rate(2048.0), "2.00 KB/s");
         assert_eq!(format_items(1.2), "1.20");
-        assert_eq!(per_minute(0.0), 0.0);
-        assert_eq!(per_minute(1.0 / 60.0), 1.0);
-        assert_eq!(format_items(per_minute(0.5)), "30.0");
+        assert_eq!(items_per_minute(0.0, 10.0), 0.0);
+        assert_eq!(items_per_minute(1.0, 10.0), 1.0);
+        assert_eq!(format_items(items_per_minute(1.0, 10.0)), "1.00");
+        assert_eq!(items_per_minute(1.0, 120.0), 0.5);
+        assert_eq!(items_per_minute(3.0, 90.0), 2.0);
+        assert_eq!(items_per_minute(2.0, 30.0), 2.0);
+        assert_eq!(format_items(items_per_minute(f64::NAN, 10.0)), "0.00");
         assert_eq!(format_elapsed(75), "1:15");
         assert_eq!(format_elapsed(3661), "1:01:01");
         assert_eq!(percent(0.999), 99);

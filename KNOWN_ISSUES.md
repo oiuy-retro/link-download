@@ -21,3 +21,7 @@ Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/iss
 ## Progress bar right edge
 
 [#36](https://github.com/oiuy-retro/link-download/issues/36). At 100% the last navy piece is a short stub after a gap, so it does not meet the right edge. This branch joins that stub to the block before it. While the bar is still filling, it may stop partway through a block.
+
+## Items per minute on a short run
+
+[#37](https://github.com/oiuy-retro/link-download/issues/37). One finished item in about ten seconds shows as 5.77 items per minute, because that one item is stretched out to a full minute. This branch does not stretch a run that is shorter than a minute, so one item shows as 1.

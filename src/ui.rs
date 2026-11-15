@@ -3192,7 +3192,7 @@ impl App {
         let elapsed = self.started.map(|start| readout::format_elapsed(start.elapsed().as_secs())).unwrap_or_else(|| "0:00".into());
         let values = [
             readout::format_rate(speed),
-            readout::format_items(readout::per_minute(items)),
+            readout::format_items(items),
             left.to_string(),
             eta.to_string(),
             elapsed,
@@ -3359,9 +3359,9 @@ fn planned_bytes(live: &Live) -> Option<f64> {
 
 fn speed_of(app: &App) -> (f64, f64) {
     let speed = app.rate.rate().unwrap_or(0.0);
-    // Whole run, waits included, so it agrees with Time left.
-    let run = app.sample_start.elapsed().as_secs_f64().max(0.25);
-    let items = app.finished as f64 / run;
+    // Whole run, waits included. A run under a minute is not scaled up.
+    let elapsed = app.sample_start.elapsed().as_secs_f64();
+    let items = readout::items_per_minute(app.finished as f64, elapsed);
     (speed, items)
 }
 
