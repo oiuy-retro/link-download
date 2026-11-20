@@ -386,19 +386,13 @@ pub fn caption_button(hdc: HDC, r: RECT, kind: CapBtn, hover: bool, press: bool,
     }
 }
 
-pub fn paint_caption(
-    hdc: HDC,
-    l: &Layout,
-    title: &str,
-    font: HFONT,
-    active: bool,
-    maximized: bool,
-    hot: CapHot,
-    press: CapHot,
-) {
-    caption_fill(hdc, l.caption, active);
+pub fn paint_caption_title(hdc: HDC, l: &Layout, title: &str, font: HFONT, active: bool) {
     let color = if active { WHITE } else { (212, 208, 200) };
     text_left(hdc, font, l.title, title, color);
+}
+
+pub fn paint_caption(hdc: HDC, l: &Layout, active: bool, maximized: bool, hot: CapHot, press: CapHot) {
+    caption_fill(hdc, l.caption, active);
     let max_kind = if maximized { CapBtn::Restore } else { CapBtn::Max };
     caption_button(
         hdc,

@@ -2,6 +2,10 @@
 
 Open copies live on the [Issues](https://github.com/oiuy-retro/link-download/issues) tab.
 
+## Fonts changed weight after the flicker fix
+
+[#42](https://github.com/oiuy-retro/link-download/issues/42). 1.2.1 drew the caption and the page title into an off-screen bitmap. MS Sans Serif is a raster font, so those words came out in another face and weight. The page also clipped its child windows, and the transparent labels, buttons, and check boxes no longer matched 1.2.0. This branch draws that text on the window and lets the page paint the gray behind its controls.
+
 ## Custom mouse cursor
 
 [#1](https://github.com/oiuy-retro/link-download/issues/1). Enhancement; no branch yet.

@@ -1145,8 +1145,9 @@ impl App {
                 let _ = EndPaint(self.hwnd, &ps);
                 return;
             }
-            // Draw the frame, caption, header and button bar off screen, then copy it in one go.
-            // Drawing straight to the screen showed each fill before the text and edges on top.
+            // Fills and edges go off screen, then one copy. Text stays on the window DC.
+            // MS Sans Serif is a raster font. A memory DC will not use it, so the caption
+            // and the page title were coming out in another face and weight.
             let hdc = CreateCompatibleDC(screen);
             let bitmap = CreateCompatibleBitmap(screen, w, h);
             let old_bitmap = SelectObject(hdc, bitmap);
@@ -1155,30 +1156,7 @@ impl App {
             let header = self.s(46);
             let bar = self.s(46);
             classic::window_frame(hdc, chrome.window, chrome.border);
-            classic::paint_caption(
-                hdc,
-                &chrome,
-                "Link Download",
-                self.caption_font,
-                self.active,
-                self.maximized(),
-                self.cap_hot,
-                self.cap_press,
-            );
-            let icon_px = chrome.icon.right - chrome.icon.left;
-            if !self.icon.0.is_null() {
-                let _ = DrawIconEx(
-                    hdc,
-                    chrome.icon.left,
-                    chrome.icon.top,
-                    self.icon,
-                    icon_px,
-                    icon_px,
-                    0,
-                    windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut()),
-                    DI_NORMAL,
-                );
-            }
+            classic::paint_caption(hdc, &chrome, self.active, self.maximized(), self.cap_hot, self.cap_press);
             let head = RECT {
                 left: chrome.inner.left,
                 top: chrome.caption.bottom,
@@ -1194,19 +1172,6 @@ impl App {
                     bottom: head.bottom,
                 };
                 let _ = DrawEdge(hdc, &mut line, EDGE_ETCHED, BF_RECT);
-                let old = SelectObject(hdc, self.title_font);
-                let _ = SetBkMode(hdc, TRANSPARENT);
-                let _ = SetTextColor(hdc, rgb(0, 0, 128));
-                let mut title = RECT {
-                    left: head.left + self.s(12),
-                    top: head.top,
-                    right: head.right - self.s(12),
-                    bottom: head.bottom - 2,
-                };
-                let mut name = wide(PAGE_NAMES[self.page]);
-                let end = name.len().saturating_sub(1);
-                let _ = DrawTextW(hdc, &mut name[..end], &mut title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                SelectObject(hdc, old);
             }
             let foot = RECT {
                 left: chrome.inner.left,
@@ -1230,6 +1195,36 @@ impl App {
             SelectObject(hdc, old_bitmap);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(hdc);
+            let icon_px = chrome.icon.right - chrome.icon.left;
+            if !self.icon.0.is_null() {
+                let _ = DrawIconEx(
+                    screen,
+                    chrome.icon.left,
+                    chrome.icon.top,
+                    self.icon,
+                    icon_px,
+                    icon_px,
+                    0,
+                    windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut()),
+                    DI_NORMAL,
+                );
+            }
+            classic::paint_caption_title(screen, &chrome, "Link Download", self.caption_font, self.active);
+            if w > 0 && header > 0 {
+                let old = SelectObject(screen, self.title_font);
+                let _ = SetBkMode(screen, TRANSPARENT);
+                let _ = SetTextColor(screen, rgb(0, 0, 128));
+                let mut title = RECT {
+                    left: head.left + self.s(12),
+                    top: head.top,
+                    right: head.right - self.s(12),
+                    bottom: head.bottom - 2,
+                };
+                let mut name = wide(PAGE_NAMES[self.page]);
+                let end = name.len().saturating_sub(1);
+                let _ = DrawTextW(screen, &mut name[..end], &mut title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(screen, old);
+            }
             let _ = EndPaint(self.hwnd, &ps);
         }
     }
@@ -1975,8 +1970,7 @@ impl App {
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 PCWSTR(class_w.as_ptr()),
                 PCWSTR(wide("").as_ptr()),
-                // WS_CLIPCHILDREN, so erasing the sheet does not paint over every control on it.
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0x40000000 | 0x10000000 | 0x02000000),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0x40000000 | 0x10000000),
                 0,
                 0,
                 10,
