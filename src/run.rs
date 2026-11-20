@@ -54,6 +54,10 @@ pub struct Live {
     pub total: u32,
     pub done: bool,
     pub error: String,
+    /// Pauses still to run, in the order they will be waited. Rolled once at the start.
+    pub waits: Vec<u32>,
+    /// Row ids that failed or were blocked during this run. Retry tries these again.
+    pub misses: Vec<u64>,
 }
 
 impl Live {
@@ -68,6 +72,8 @@ impl Live {
             total: 0,
             done: false,
             error: String::new(),
+            waits: Vec::new(),
+            misses: Vec::new(),
         }
     }
 }
@@ -98,10 +104,11 @@ struct RunOut {
 }
 
 pub fn fetch(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg_dir: PathBuf, urls: Vec<String>) {
+    let node_dir = crate::tools::node_dir(&node);
     reset(&shared);
     let mut groups = Vec::new();
     set_status(&shared, "Updating yt-dlp…");
-    match run_command(&shared, &ytdlp, &commands::update_args(&node, &ffmpeg_dir), Some(&ffmpeg_dir), false, |_| {}) {
+    match run_command(&shared, &ytdlp, &commands::update_args(&node, &ffmpeg_dir), Some(&node_dir), false, |_| {}) {
         Ok(output) if output.code != 0 => {
             shared.live.lock().expect("live").error = "yt-dlp did not update. Using the current copy.".into();
         }
@@ -124,7 +131,7 @@ pub fn fetch(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg_dir: Pat
             live.total = urls.len() as u32;
             live.ok = index as u32;
         }
-        match run_command(&shared, &ytdlp, &commands::dump_args(&node, &ffmpeg_dir, url), Some(&ffmpeg_dir), true, |_| {}) {
+        match run_command(&shared, &ytdlp, &commands::dump_args(&node, &ffmpeg_dir, url), Some(&node_dir), true, |_| {}) {
             Ok(output) => groups.push(group_from_dump(url, &output)),
             Err(err) => groups.push(error_group(url, &err)),
         }
@@ -134,6 +141,7 @@ pub fn fetch(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg_dir: Pat
 }
 
 pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: PathBuf, ffmpeg_dir: PathBuf, opts: Options, mut groups: Vec<Group>) {
+    let node_dir = crate::tools::node_dir(&node);
     reset(&shared);
     // The Location box already makes the folder a full path. This is a second
     // guard: ffmpeg runs from the output folder, so a relative folder would be
@@ -151,8 +159,16 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
         live.bad = already_bad;
         live.rows = rows;
     }
+    let attempts = plan_attempts(&opts, &groups);
     let mut rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1);
-    let mut seen = 0u32;
+    {
+        let mut live = shared.live.lock().expect("live");
+        live.waits = commands::wait_plan(attempts.len(), opts.min_wait, opts.max_wait, &mut rng);
+    }
+    if !attempts.is_empty() && !read_sizes(&shared, &ytdlp, &node, &ffmpeg_dir, &opts, &attempts) {
+        finish(&shared, groups, "");
+        return;
+    }
     // Finished-file paths that items of this run are heading for. Two items with
     // the same title in the same folder must not make the second one look
     // "Already saved" because the first one just made that file.
@@ -176,7 +192,6 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             }
         }
         for (index, item) in group.items.iter_mut().enumerate() {
-            seen += 1;
             if cancelled(&shared) {
                 finish(&shared, groups, "");
                 return;
@@ -215,6 +230,10 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             if let Err(err) = fs::create_dir_all(dir) {
                 fail(&shared, row_id, &err.to_string());
                 journal(&format!("could not create {}: {err}", dir.display()));
+                if !end_attempt(&shared, false) {
+                    finish(&shared, groups, "");
+                    return;
+                }
                 continue;
             }
             // yt-dlp downloads into a hidden folder inside the music folder, one
@@ -225,6 +244,10 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
             if let Err(err) = partial::prepare(Path::new(&opts.location)).and_then(|_| fs::create_dir_all(&work)) {
                 fail(&shared, row_id, &err.to_string());
                 journal(&format!("could not create {}: {err}", work.display()));
+                if !end_attempt(&shared, false) {
+                    finish(&shared, groups, "");
+                    return;
+                }
                 continue;
             }
             let stem = paths::download_stem(&work, &item.title);
@@ -244,7 +267,7 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                 let shared_progress = shared.clone();
                 // Fresh for each attempt, so a retry counts from the start again.
                 let mut tracker = commands::ItemProgress::default();
-                let result = run_command(&shared, &ytdlp, &args, Some(&ffmpeg_dir), false, move |line| {
+                let result = run_command(&shared, &ytdlp, &args, Some(&node_dir), false, move |line| {
                     if let Some(bytes) = commands::parse_expected_bytes(line) {
                         tracker.expect(bytes);
                         return;
@@ -309,12 +332,11 @@ pub fn download(shared: Arc<Shared>, ytdlp: PathBuf, node: PathBuf, ffmpeg: Path
                     fail(&shared, row_id, "The download finished without a file.");
                 }
             }
-            if fetched_now && seen < jobs {
-                let seconds = commands::wait_seconds(opts.min_wait, opts.max_wait, &mut rng);
-                if seconds > 0 && !countdown(&shared, next_queued(&shared), seconds, "Waiting") {
-                    finish(&shared, groups, "");
-                    return;
-                }
+            // The pause after this file was rolled at the start. A failed download
+            // drops its pause, because nothing is waited then.
+            if !end_attempt(&shared, fetched_now) {
+                finish(&shared, groups, "");
+                return;
             }
         }
     }
@@ -796,6 +818,170 @@ fn trim_log(text: &mut String) {
     }
 }
 
+struct Attempt {
+    row_id: u64,
+    id: String,
+    url: String,
+    playlist_item: Option<u32>,
+}
+
+/// Items this run will download, in the order the loop downloads them.
+/// Already saved files, and files still waiting to be converted, are left out.
+/// Keep these checks in step with the download loop.
+fn plan_attempts(opts: &Options, groups: &[Group]) -> Vec<Attempt> {
+    let mut claimed = std::collections::HashSet::new();
+    let mut attempts = Vec::new();
+    for group in groups {
+        let dirs: Vec<PathBuf> = (0..group.items.len())
+            .map(|index| paths::output_dir(Path::new(&opts.location), group, index))
+            .collect();
+        for (index, item) in group.items.iter().enumerate() {
+            if item.blocked.is_some() || (item.download_url.is_empty() && item.playlist_item.is_none()) {
+                continue;
+            }
+            let finished = paths::final_file(&dirs[index], &item.title, opts.container.extension());
+            let waiting = item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false);
+            let mine_earlier = claimed.contains(&finished);
+            if !opts.overwrite && !waiting && !mine_earlier && finished.is_file() {
+                continue;
+            }
+            claimed.insert(finished);
+            if item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false) {
+                continue;
+            }
+            attempts.push(Attempt {
+                row_id: row_id_for(group, index),
+                id: item.id.clone(),
+                url: item.download_url.clone(),
+                playlist_item: item.playlist_item,
+            });
+        }
+    }
+    attempts
+}
+
+/// Asks yt-dlp for each file's size and stores it on the row. False means Cancel.
+fn read_sizes(shared: &Shared, ytdlp: &Path, node: &Path, ffmpeg_dir: &Path, opts: &Options, attempts: &[Attempt]) -> bool {
+    set_status(shared, "Reading sizes…");
+    let mut sizes = std::collections::HashMap::<String, u64>::new();
+    let direct = unique_in_order(attempts.iter().filter(|attempt| attempt.playlist_item.is_none()).map(|attempt| attempt.url.as_str()));
+    for chunk in direct.chunks(40) {
+        if !collect_sizes(shared, ytdlp, node, ffmpeg_dir, opts, chunk, None, &mut sizes) {
+            return false;
+        }
+    }
+    for (url, items) in playlist_groups(attempts) {
+        if !collect_sizes(shared, ytdlp, node, ffmpeg_dir, opts, &[url.as_str()], Some(items.as_str()), &mut sizes) {
+            return false;
+        }
+    }
+    let mut matched = 0usize;
+    for attempt in attempts {
+        if let Some(bytes) = sizes.get(&attempt.id) {
+            set_row_size(shared, attempt.row_id, *bytes);
+            matched += 1;
+        }
+    }
+    journal(&format!("sizes known for {matched} of {} downloads", attempts.len()));
+    true
+}
+
+fn unique_in_order<'a>(urls: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for url in urls {
+        if url.is_empty() || !seen.insert(url) {
+            continue;
+        }
+        out.push(url);
+    }
+    out
+}
+
+fn playlist_groups(attempts: &[Attempt]) -> Vec<(String, String)> {
+    let mut order = Vec::new();
+    let mut groups = std::collections::HashMap::<String, Vec<u32>>::new();
+    for attempt in attempts.iter().filter(|attempt| attempt.playlist_item.is_some()) {
+        let index = attempt.playlist_item.unwrap();
+        if !groups.contains_key(&attempt.url) {
+            order.push(attempt.url.clone());
+        }
+        let items = groups.entry(attempt.url.clone()).or_default();
+        if !items.contains(&index) {
+            items.push(index);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|url| {
+            let items = groups.remove(&url)?;
+            let text = items.iter().map(|index| index.to_string()).collect::<Vec<_>>().join(",");
+            Some((url, text))
+        })
+        .collect()
+}
+
+/// False means Cancel. Any other failure leaves those sizes unknown.
+fn collect_sizes(
+    shared: &Shared,
+    ytdlp: &Path,
+    node: &Path,
+    ffmpeg_dir: &Path,
+    opts: &Options,
+    urls: &[&str],
+    playlist_items: Option<&str>,
+    sizes: &mut std::collections::HashMap<String, u64>,
+) -> bool {
+    if urls.is_empty() {
+        return true;
+    }
+    let owned: Vec<String> = urls.iter().map(|url| (*url).to_string()).collect();
+    let args = commands::size_args(opts, &owned, playlist_items, node, ffmpeg_dir);
+    // Same folder as the download: yt-dlp resolves `node:<file name>` from its working directory.
+    let node_dir = crate::tools::node_dir(node);
+    match run_command(shared, ytdlp, &args, Some(&node_dir), true, |_| {}) {
+        Ok(output) => {
+            for line in output.stdout.lines() {
+                if let Some((id, bytes)) = commands::parse_size_line(line) {
+                    sizes.insert(id, bytes);
+                }
+            }
+            true
+        }
+        Err(err) if err == "Stopped." => false,
+        Err(err) => {
+            journal(&format!("sizes were not read ({err})"));
+            true
+        }
+    }
+}
+
+fn set_row_size(shared: &Shared, id: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    if let Some(row) = shared.live.lock().expect("live").rows.iter_mut().find(|row| row.id == id) {
+        row.size = size;
+    }
+}
+
+fn pop_wait(shared: &Shared) -> Option<u32> {
+    let mut live = shared.live.lock().expect("live");
+    if live.waits.is_empty() { None } else { Some(live.waits.remove(0)) }
+}
+
+/// Uses the next pre-rolled pause when the download worked. A failure drops that
+/// pause. False means Cancel was pressed during the pause.
+fn end_attempt(shared: &Shared, fetched_now: bool) -> bool {
+    let Some(seconds) = pop_wait(shared) else {
+        return true;
+    };
+    if !fetched_now || seconds == 0 {
+        return true;
+    }
+    countdown(shared, next_queued(shared), seconds, "Waiting")
+}
+
 fn countdown(shared: &Shared, row_id: u64, seconds: u32, label: &str) -> bool {
     if row_id != 0 {
         set_kind(shared, row_id, RowKind::Waiting, "");
@@ -914,6 +1100,7 @@ fn pin(shared: &Shared, id: u64, note: &str, missing_or_age: bool) {
         let insert = live.rows.iter().position(|row| row.kind != RowKind::Pinned).unwrap_or(live.rows.len());
         live.rows.insert(insert, row);
         live.bad += 1;
+        remember_miss(&mut live, id);
     }
 }
 
@@ -924,6 +1111,36 @@ fn fail(shared: &Shared, id: u64, note: &str) {
         row.note = note.to_string();
         live.bad += 1;
         live.status = note.to_string();
+        remember_miss(&mut live, id);
+    }
+}
+
+fn remember_miss(live: &mut Live, id: u64) {
+    if !live.misses.contains(&id) {
+        live.misses.push(id);
+    }
+}
+
+/// Clears the block on items this run failed to download, so Retry can try them
+/// again. A download that is still on disk, waiting to be converted, is kept.
+/// Items that are not in `misses` stay as they are, including videos that were
+/// already unavailable before the run.
+pub fn release_for_retry(groups: &mut [Group], misses: &[u64]) {
+    let missed: std::collections::HashSet<u64> = misses.iter().copied().collect();
+    if missed.is_empty() {
+        return;
+    }
+    for group in groups.iter_mut() {
+        for (index, item) in group.items.iter_mut().enumerate() {
+            if !missed.contains(&row_id_url(&group.source_url, index)) {
+                continue;
+            }
+            item.blocked = None;
+            let waiting = item.temp_path.as_ref().map(|path| Path::new(path).is_file()).unwrap_or(false);
+            if !waiting {
+                item.temp_path = None;
+            }
+        }
     }
 }
 
@@ -1220,5 +1437,93 @@ mod tests {
         );
         assert!(!json_only.error.contains("timedtext"), "{}", json_only.error);
         assert!(!json_only.error.contains("yt_dlp_client"), "{}", json_only.error);
+    }
+
+    fn queued(id: u64) -> WorkRow {
+        WorkRow {
+            id,
+            name: "Song".into(),
+            size: 0,
+            copied: 0,
+            fraction: 0.0,
+            convert: 0.0,
+            kind: RowKind::Queued,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_failed_download_is_remembered_for_retry() {
+        let shared = Shared::new();
+        shared.live.lock().expect("live").rows.push(queued(7));
+        fail(&shared, 7, "The download finished without a file.");
+        fail(&shared, 7, "The download finished without a file.");
+        let live = shared.live.lock().expect("live");
+        assert_eq!(live.misses, vec![7]);
+        assert_eq!(live.rows[0].kind, RowKind::Failed);
+    }
+
+    #[test]
+    fn an_age_block_during_the_run_is_remembered_for_retry() {
+        let shared = Shared::new();
+        shared.live.lock().expect("live").rows.push(queued(4));
+        pin(&shared, 4, "Age restricted", true);
+        let live = shared.live.lock().expect("live");
+        assert_eq!(live.misses, vec![4]);
+        assert_eq!(live.rows[0].kind, RowKind::Pinned);
+        assert_eq!(live.rows[0].note, "Age restricted");
+    }
+
+    fn plain_item(title: &str) -> crate::model::Item {
+        crate::model::Item {
+            id: title.into(),
+            title: title.into(),
+            meta_title: title.into(),
+            original_title: title.into(),
+            original_artists: Vec::new(),
+            artists: Vec::new(),
+            download_url: format!("https://example.test/{title}"),
+            playlist_item: None,
+            track_number: None,
+            duration: 0.0,
+            thumbnail: String::new(),
+            temp_path: None,
+            blocked: None,
+        }
+    }
+
+    #[test]
+    fn retry_clears_only_the_links_that_failed() {
+        let mut kept = plain_item("Kept");
+        kept.blocked = Some(Block::Missing);
+        let mut failed = plain_item("Failed");
+        failed.blocked = Some(Block::Age);
+        failed.temp_path = Some(std::env::temp_dir().join("link-download-no-such-retry-file").display().to_string());
+        let mut waiting = plain_item("Waiting");
+        let dir = std::env::temp_dir().join(format!("link-download-retry-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("waiting.bin");
+        fs::write(&file, b"x").unwrap();
+        waiting.temp_path = Some(file.display().to_string());
+        let mut groups = vec![Group {
+            source_url: "https://example.test/list".into(),
+            is_playlist: false,
+            playlist_title: String::new(),
+            album: String::new(),
+            original_album: String::new(),
+            playlist_thumbnail: String::new(),
+            error: String::new(),
+            items: vec![kept, failed, waiting],
+        }];
+        let failed_id = row_id_url(&groups[0].source_url, 1);
+        let waiting_id = row_id_url(&groups[0].source_url, 2);
+        release_for_retry(&mut groups, &[failed_id, waiting_id]);
+        assert_eq!(groups[0].items[0].blocked, Some(Block::Missing));
+        assert!(groups[0].items[1].blocked.is_none());
+        assert!(groups[0].items[1].temp_path.is_none());
+        assert!(groups[0].items[2].blocked.is_none());
+        assert_eq!(groups[0].items[2].temp_path.as_deref().map(Path::new), Some(file.as_path()));
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir(&dir);
     }
 }

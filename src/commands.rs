@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::model::{AudioCodec, AudioQuality, Container, Options, Resolution, VideoCodec};
+use crate::model::{can_copy_audio, can_copy_video, AudioCodec, AudioQuality, Container, Options, Resolution, VideoCodec};
 
 /// `download:` is yt-dlp's progress *type*, not part of the printed line.
 /// The template itself must start with `download:` so `parse_progress` can find it.
@@ -12,6 +12,12 @@ pub const PROGRESS_TEMPLATE: &str =
 /// Printed once per video before the download starts. For a video with separate
 /// video and audio parts, yt-dlp gives the size of both parts together here.
 pub const EXPECTED_PRINT: &str = "before_dl:expected_bytes:%(filesize,filesize_approx)s";
+
+/// Printed once per video by the size pass, before anything is downloaded.
+/// `filesize` is the byte count when the site sent one. `filesize_approx` is
+/// bitrate times length when it did not. For separate picture and audio, yt-dlp
+/// adds the two parts together, the same number `EXPECTED_PRINT` reads later.
+pub const SIZE_PRINT: &str = "size:%(id)s|%(filesize,filesize_approx)s";
 
 /// yt-dlp reads the first `after_move:` as when to print and leaves it out of the
 /// output, so it is written twice to keep the prefix `parse_after_move` looks for.
@@ -123,15 +129,15 @@ impl ItemProgress {
 }
 
 pub fn tool_args(node: &Path, ffmpeg_dir: &Path) -> Vec<String> {
-    // `node:C:\...` is split on the drive-letter colon, so the runtime is the
-    // node.exe sitting in the program folder. Callers run yt-dlp with that folder
-    // as the working directory.
-    let _ = node;
+    // The runtime is given by file name only, and callers run yt-dlp in node's
+    // folder (tools::node_dir), so no drive-letter colon ever reaches the
+    // `RUNTIME:PATH` value.
+    let node_name = node.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "node.exe".into());
     vec![
         "--ignore-config".into(),
         "--no-colors".into(),
         "--js-runtimes".into(),
-        "node:node.exe".into(),
+        format!("node:{node_name}"),
         "--ffmpeg-location".into(),
         ffmpeg_dir.display().to_string(),
     ]
@@ -215,6 +221,33 @@ pub fn download_args(opts: &Options, url: &str, playlist_item: Option<u32>, outp
     args
 }
 
+/// Sizes of the files this run will save, without downloading them.
+/// `playlist_items` is `Some("1,3,4")` for one playlist URL. Direct video URLs
+/// pass `None` and are read with `--no-playlist`.
+pub fn size_args(opts: &Options, urls: &[String], playlist_items: Option<&str>, node: &Path, ffmpeg_dir: &Path) -> Vec<String> {
+    let mut args = tool_args(node, ffmpeg_dir);
+    args.extend([
+        "--encoding".into(),
+        "utf-8".into(),
+        "--skip-download".into(),
+        "--ignore-errors".into(),
+        "--no-warnings".into(),
+        "-f".into(),
+        format_selector(opts),
+        "--print".into(),
+        SIZE_PRINT.into(),
+    ]);
+    if let Some(items) = playlist_items {
+        args.push("--playlist-items".into());
+        args.push(items.to_string());
+    } else {
+        args.push("--no-playlist".into());
+    }
+    args.push("--".into());
+    args.extend(urls.iter().cloned());
+    args
+}
+
 pub fn format_selector(opts: &Options) -> String {
     if opts.reencode {
         return if opts.audio_only {
@@ -226,40 +259,139 @@ pub fn format_selector(opts: &Options) -> String {
         };
     }
     if opts.audio_only {
-        return audio_selector(opts.audio_codec, opts.audio_quality);
+        return audio_selector(opts.audio_codec, opts.audio_quality, opts.container);
     }
-    video_selector(opts.resolution, opts.video_codec, opts.audio_codec, opts.audio_quality)
+    video_selector(opts.resolution, opts.video_codec, opts.audio_codec, opts.audio_quality, opts.container)
 }
 
-fn audio_selector(codec: AudioCodec, quality: AudioQuality) -> String {
-    let Some(filter) = audio_filter(codec) else {
-        return match quality.kbps() {
-            Some(kbps) => format!("ba[abr<={kbps}]/ba/b"),
-            None => "ba/b".into(),
-        };
-    };
-    match quality.kbps() {
-        Some(kbps) => format!("ba{filter}[abr<={kbps}]/ba{filter}"),
-        None => format!("ba{filter}"),
+/// Most efficient first. A video that lacks the chosen codec gets the next one on this list.
+const VIDEO_EFFICIENCY: [VideoCodec; 6] = [
+    VideoCodec::Av1,
+    VideoCodec::H265,
+    VideoCodec::Vp9,
+    VideoCodec::H264,
+    VideoCodec::Vp8,
+    VideoCodec::Mpeg4,
+];
+
+/// Most efficient lossy codecs first, then the lossless ones.
+const AUDIO_EFFICIENCY: [AudioCodec; 7] = [
+    AudioCodec::Opus,
+    AudioCodec::Aac,
+    AudioCodec::Vorbis,
+    AudioCodec::Mp3,
+    AudioCodec::Flac,
+    AudioCodec::Alac,
+    AudioCodec::Pcm,
+];
+
+/// The chosen video codec, then every other codec the container can hold, most efficient first.
+/// One empty filter means "any codec".
+fn video_chain(chosen: VideoCodec, container: Container) -> Vec<&'static str> {
+    if chosen == VideoCodec::Any && container == Container::Mkv {
+        return vec![""];
     }
+    let mut codecs = Vec::new();
+    if chosen != VideoCodec::Any {
+        codecs.push(chosen);
+    }
+    for codec in VIDEO_EFFICIENCY {
+        if codec != chosen && can_copy_video(codec, container) {
+            codecs.push(codec);
+        }
+    }
+    let filters: Vec<&'static str> = codecs.into_iter().flat_map(video_filters).collect();
+    if filters.is_empty() { vec![""] } else { filters }
 }
 
-fn video_selector(resolution: Resolution, video: VideoCodec, audio: AudioCodec, quality: AudioQuality) -> String {
-    let height = resolution.height().map(|h| format!("[height<={h}]")).unwrap_or_default();
-    let audio = audio_filter(audio).unwrap_or_default();
-    let abr = quality.kbps().map(|kbps| format!("[abr<={kbps}]")).unwrap_or_default();
-    let videos = video_filters(video);
-    if videos.is_empty() {
-        return format!("bv*{height}+ba{audio}{abr}/b{height}{audio}{abr}");
+fn audio_chain(chosen: AudioCodec, container: Container) -> Vec<&'static str> {
+    if chosen == AudioCodec::Any && matches!(container, Container::Mkv | Container::Mka) {
+        return vec![""];
     }
+    let mut codecs = Vec::new();
+    if chosen != AudioCodec::Any {
+        codecs.push(chosen);
+    }
+    for codec in AUDIO_EFFICIENCY {
+        if codec != chosen && can_copy_audio(codec, container) {
+            codecs.push(codec);
+        }
+    }
+    let filters: Vec<&'static str> = codecs.into_iter().filter_map(audio_filter).collect();
+    if filters.is_empty() { vec![""] } else { filters }
+}
+
+/// Height bands from the chosen resolution down. Each band runs from one menu size to the
+/// next smaller one, so a 1072-line video still counts as 1080p.
+fn height_bands(resolution: Resolution) -> Vec<String> {
+    let heights: Vec<i32> = Resolution::ALL.iter().filter_map(|r| r.height()).collect();
+    let mut bands = Vec::new();
+    let top = resolution.height();
+    if top.is_none() {
+        // Best: anything above the largest menu size first.
+        bands.push(format!("[height>{}]", heights[0]));
+    }
+    for (index, &height) in heights.iter().enumerate() {
+        if top.is_some_and(|top| height > top) {
+            continue;
+        }
+        match heights.get(index + 1) {
+            Some(lower) => bands.push(format!("[height<={height}][height>{lower}]")),
+            None => bands.push(format!("[height<={height}]")),
+        }
+    }
+    bands
+}
+
+fn audio_part(codecs: &[&str], abr: &str) -> String {
     let mut parts = Vec::new();
-    for filter in &videos {
-        parts.push(format!("bv*{height}{filter}+ba{audio}{abr}"));
+    if !abr.is_empty() {
+        for codec in codecs {
+            parts.push(format!("ba{codec}{abr}"));
+        }
     }
-    for filter in &videos {
-        parts.push(format!("b{height}{filter}{audio}{abr}"));
+    for codec in codecs {
+        parts.push(format!("ba{codec}"));
     }
     parts.join("/")
+}
+
+fn audio_selector(codec: AudioCodec, quality: AudioQuality, container: Container) -> String {
+    let abr = quality.kbps().map(|kbps| format!("[abr<={kbps}]")).unwrap_or_default();
+    let codecs = audio_chain(codec, container);
+    let mut spec = audio_part(&codecs, &abr);
+    if codecs == [""] {
+        // Any codec: a file with video is still better than nothing. The video is dropped later.
+        spec.push_str("/b");
+    }
+    spec
+}
+
+/// Resolution comes first: every allowed codec is tried at the chosen size before a smaller size.
+/// Inside one size the chosen codec wins, then the most efficient one the container can hold.
+fn video_selector(resolution: Resolution, video: VideoCodec, audio: AudioCodec, quality: AudioQuality, container: Container) -> String {
+    let abr = quality.kbps().map(|kbps| format!("[abr<={kbps}]")).unwrap_or_default();
+    let videos = video_chain(video, container);
+    let audios = audio_chain(audio, container);
+    let mut picks = Vec::new();
+    for band in height_bands(resolution) {
+        for filter in &videos {
+            picks.push(format!("bv*{band}{filter}"));
+        }
+    }
+    // Nothing at or below the chosen size. Take the smallest larger one rather than fail.
+    for filter in &videos {
+        picks.push(format!("wv*{filter}"));
+    }
+    let cap = resolution.height().map(|h| format!("[height<={h}]")).unwrap_or_default();
+    let mut whole = Vec::new();
+    for filter in &videos {
+        whole.push(format!("b{cap}{filter}"));
+    }
+    for filter in &videos {
+        whole.push(format!("w{filter}"));
+    }
+    format!("({})+({})/{}", picks.join("/"), audio_part(&audios, &abr), whole.join("/"))
 }
 
 fn audio_filter(codec: AudioCodec) -> Option<&'static str> {
@@ -570,6 +702,18 @@ pub fn parse_expected_bytes(line: &str) -> Option<u64> {
     number_u64(line.trim().strip_prefix("expected_bytes:")?).filter(|bytes| *bytes > 0)
 }
 
+/// `size:videoId|252182` from the size pass. `NA` and `0` are unknown.
+pub fn parse_size_line(line: &str) -> Option<(String, u64)> {
+    let rest = line.trim().strip_prefix("size:")?;
+    let (id, bytes) = rest.split_once('|')?;
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let bytes = number_u64(bytes).filter(|bytes| *bytes > 0)?;
+    Some((id.to_string(), bytes))
+}
+
 pub fn parse_after_move(line: &str) -> Option<String> {
     let path = line.trim().strip_prefix("after_move:")?.trim();
     if path.is_empty() { None } else { Some(path.to_string()) }
@@ -602,6 +746,12 @@ pub fn wait_seconds(min: u32, max: u32, rng: &mut u32) -> u32 {
     }
     *rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
     min + (*rng % (max - min + 1))
+}
+
+/// One pause for each gap between `downloads` files, rolled now so Time left can
+/// count the same seconds the run will wait.
+pub fn wait_plan(downloads: usize, min: u32, max: u32, rng: &mut u32) -> Vec<u32> {
+    (0..downloads.saturating_sub(1)).map(|_| wait_seconds(min, max, rng)).collect()
 }
 
 #[cfg(test)]
@@ -651,7 +801,109 @@ mod tests {
         opts.audio_codec = AudioCodec::Opus;
         opts.audio_quality = AudioQuality::K160;
         opts.container = crate::model::Container::M4a;
-        assert_eq!(format_selector(&opts), "ba[acodec^=opus][abr<=160]/ba[acodec^=opus]");
+        assert_eq!(
+            format_selector(&opts),
+            "ba[acodec^=opus][abr<=160]/ba[acodec^=mp4a][abr<=160]/ba[acodec^=mp3][abr<=160]/ba[acodec^=flac][abr<=160]/ba[acodec^=alac][abr<=160]/ba[acodec^=opus]/ba[acodec^=mp4a]/ba[acodec^=mp3]/ba[acodec^=flac]/ba[acodec^=alac]"
+        );
+    }
+
+    fn picks(spec: &str) -> Vec<String> {
+        let inner = spec.strip_prefix('(').unwrap();
+        let end = inner.find(")+(").unwrap();
+        inner[..end].split('/').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_missing_codec_falls_back_at_the_same_size_first() {
+        let mut opts = video_opts();
+        opts.resolution = Resolution::P1080;
+        opts.video_codec = VideoCodec::Av1;
+        opts.container = Container::Mp4;
+        let list = picks(&format_selector(&opts));
+        // MP4 holds AV1, H.265, H.264 and MPEG-4, but not VP9 or VP8.
+        assert_eq!(
+            &list[..5],
+            [
+                "bv*[height<=1080][height>720][vcodec^=av01]",
+                "bv*[height<=1080][height>720][vcodec^=hev1]",
+                "bv*[height<=1080][height>720][vcodec^=hvc1]",
+                "bv*[height<=1080][height>720][vcodec^=avc1]",
+                "bv*[height<=1080][height>720][vcodec^=mp4v]",
+            ]
+        );
+        assert!(list[6].starts_with("bv*[height<=720][height>480][vcodec^=av01]"));
+        assert!(!list.iter().any(|pick| pick.contains("vp9") || pick.contains("vp8")));
+        assert!(!list.iter().any(|pick| pick.contains("height<=1440")));
+    }
+
+    #[test]
+    fn the_chosen_codec_is_tried_first_then_the_most_efficient() {
+        let mut opts = video_opts();
+        opts.resolution = Resolution::P720;
+        opts.video_codec = VideoCodec::H264;
+        opts.container = Container::Mkv;
+        let list = picks(&format_selector(&opts));
+        let order: Vec<&str> = list.iter().take(9).map(|pick| pick.rsplit('[').next().unwrap()).collect();
+        assert_eq!(order, ["vcodec^=avc1]", "vcodec^=av01]", "vcodec^=hev1]", "vcodec^=hvc1]", "vcodec^=vp9]", "vcodec^=vp09]", "vcodec^=vp8]", "vcodec^=vp08]", "vcodec^=mp4v]"]);
+    }
+
+    #[test]
+    fn webm_only_falls_back_to_codecs_webm_holds() {
+        let mut opts = video_opts();
+        opts.video_codec = VideoCodec::Vp9;
+        opts.audio_codec = AudioCodec::Opus;
+        opts.container = Container::Webm;
+        let spec = format_selector(&opts);
+        assert!(!spec.contains("avc1"));
+        assert!(!spec.contains("mp4a"));
+        assert!(spec.contains("vcodec^=av01"));
+        assert!(spec.contains("+(ba[acodec^=opus]/ba[acodec^=vorbis]"));
+    }
+
+    #[test]
+    fn audio_falls_back_to_the_next_efficient_codec() {
+        let mut opts = video_opts();
+        opts.audio_codec = AudioCodec::Aac;
+        opts.audio_quality = AudioQuality::Best;
+        opts.container = Container::Mp4;
+        let spec = format_selector(&opts);
+        assert!(spec.contains("+(ba[acodec^=mp4a]/ba[acodec^=opus]/ba[acodec^=mp3]/"));
+    }
+
+    #[test]
+    fn nothing_small_enough_takes_the_smallest_larger_size() {
+        let mut opts = video_opts();
+        opts.resolution = Resolution::P144;
+        opts.video_codec = VideoCodec::H264;
+        opts.container = Container::Mkv;
+        let spec = format_selector(&opts);
+        let list = picks(&spec);
+        assert!(list.iter().any(|pick| pick == "bv*[height<=144][vcodec^=avc1]"));
+        assert!(list.iter().any(|pick| pick == "wv*[vcodec^=avc1]"));
+        assert!(spec.contains(")/b[height<=144][vcodec^=avc1]/"));
+    }
+
+    #[test]
+    fn best_starts_above_the_largest_size() {
+        let mut opts = video_opts();
+        opts.resolution = Resolution::Best;
+        opts.video_codec = VideoCodec::Any;
+        opts.audio_codec = AudioCodec::Any;
+        opts.container = Container::Mkv;
+        let spec = format_selector(&opts);
+        assert!(spec.starts_with("(bv*[height>4320]/bv*[height<=4320][height>2160]/"));
+        assert!(spec.contains(")+(ba)/b/w"));
+    }
+
+    #[test]
+    fn the_selector_stays_short_enough_for_a_command_line() {
+        let mut opts = video_opts();
+        opts.resolution = Resolution::Best;
+        opts.video_codec = VideoCodec::Mpeg4;
+        opts.audio_codec = AudioCodec::Pcm;
+        opts.audio_quality = AudioQuality::K160;
+        opts.container = Container::Mkv;
+        assert!(format_selector(&opts).len() < 8000);
     }
 
     #[test]
@@ -798,6 +1050,53 @@ mod tests {
         assert_eq!(parse_expected_bytes("expected_bytes:0"), None);
         assert_eq!(parse_expected_bytes("download:downloading|1|2|NA|3"), None);
         assert!(parse_progress("expected_bytes:437474").is_none());
+    }
+
+    #[test]
+    fn tool_args_pass_resolved_node_and_ffmpeg() {
+        let args = tool_args(Path::new("D:\\apps\\node\\node22.exe"), Path::new("D:\\apps\\ffmpeg\\bin"));
+        assert!(has_pair(&args, "--js-runtimes", "node:node22.exe"));
+        assert!(has_pair(&args, "--ffmpeg-location", "D:\\apps\\ffmpeg\\bin"));
+    }
+
+    #[test]
+    fn size_args_ask_for_the_selected_format_without_downloading() {
+        let opts = video_opts();
+        let urls = ["https://example.com/a".to_string(), "https://example.com/b".to_string()];
+        let args = size_args(&opts, &urls, None, Path::new("node.exe"), Path::new("."));
+        assert!(args.iter().any(|arg| arg == "--skip-download"));
+        assert!(args.iter().any(|arg| arg == "--ignore-errors"));
+        assert!(args.iter().any(|arg| arg == "--no-playlist"));
+        assert!(args.windows(2).any(|pair| pair[0] == "--print" && pair[1] == SIZE_PRINT));
+        assert!(args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == format_selector(&opts)));
+        assert!(args.ends_with(&["--".into(), urls[0].clone(), urls[1].clone()]));
+    }
+
+    #[test]
+    fn size_args_for_a_playlist_use_item_numbers() {
+        let args = size_args(&video_opts(), &["https://example.com/list".into()], Some("1,3"), Path::new("node.exe"), Path::new("."));
+        assert!(args.windows(2).any(|pair| pair[0] == "--playlist-items" && pair[1] == "1,3"));
+        assert!(!args.iter().any(|arg| arg == "--no-playlist"));
+    }
+
+    #[test]
+    fn size_lines_parse() {
+        assert_eq!(parse_size_line("size:abc|252182"), Some(("abc".into(), 252182)));
+        assert_eq!(parse_size_line("size:abc|NA"), None);
+        assert_eq!(parse_size_line("size:abc|0"), None);
+        assert_eq!(parse_size_line("download:downloading|1|2|NA|3"), None);
+    }
+
+    #[test]
+    fn wait_plan_rolls_one_pause_between_each_download() {
+        let mut rng = 1u32;
+        let waits = wait_plan(3, 4, 8, &mut rng);
+        assert_eq!(waits.len(), 2);
+        assert!(waits.iter().all(|seconds| (4..=8).contains(seconds)));
+        let mut again = 1u32;
+        assert_eq!(wait_plan(3, 4, 8, &mut again), waits);
+        assert!(wait_plan(1, 4, 8, &mut rng).is_empty());
+        assert!(wait_plan(0, 4, 8, &mut rng).is_empty());
     }
 
     #[test]
