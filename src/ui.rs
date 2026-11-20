@@ -142,8 +142,6 @@ thread_local! {
     static THICKENING_NAME: Cell<bool> = const { Cell::new(false) };
     /// 8 pt bold, the same size as the list. A larger face spills past the editor.
     static MARK_TINY: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
-    /// Screen DPI the overall progress bar paints its blocks at. Set when the app starts.
-    static BAR_DPI: Cell<i32> = const { Cell::new(96) };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -706,7 +704,7 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // does not paint that part, so this bar has to start white or the track is gray.
             let _ = FillRect(hdc, &rect, white_brush());
             let pos = GetWindowLongPtrW(hwnd, GWLP_USERDATA).clamp(0, 1000);
-            chunks(hdc, rect, pos as f64 / 1000.0, BAR_DPI.get());
+            chunks(hdc, rect, pos as f64 / 1000.0);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -897,7 +895,6 @@ fn cancel_work() {
 impl App {
     fn boot(instance: HINSTANCE) -> Self {
         let dpi = screen_dpi();
-        BAR_DPI.set(dpi);
         let memory = store::load();
         let active = memory.last_profile.clone();
         let mut options = memory
@@ -1942,7 +1939,7 @@ impl App {
             let class = class_name(kid.hwnd);
             // A progress bar is a little shorter than its slot when the slot is
             // not an exact run of blocks, so the gaps stay equal.
-            let width = if class == "LinkProgressBar" { bar_outer(w, self.dpi).max(1) } else { w };
+            let width = if class == "LinkProgressBar" { bar_outer(w, led_width(h)).max(1) } else { w };
             unsafe { let _ = MoveWindow(kid.hwnd, x, y, width, h, false); }
             if class == "SysListView32" {
                 // LVM_SETCOLUMNWIDTH. Fit the column to the inside of the list, so a guessed
@@ -3568,7 +3565,7 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
         );
         return;
     }
-    let bar_h = ((rect.bottom - rect.top) - scale(6, dpi)).clamp(scale(8, dpi), scale(14, dpi));
+    let bar_h = row_bar_height(rect.bottom - rect.top, dpi);
     let top = rect.top + (rect.bottom - rect.top - bar_h) / 2;
     let (before, after) = (bar_before(dpi), bar_after(dpi));
     let download = RECT {
@@ -3584,21 +3581,22 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
         bottom: top + bar_h,
     };
     let download_fraction = if row.kind == RowKind::Pinned { 0.0 } else { row.fraction };
-    chunks(hdc, download, download_fraction, dpi);
-    chunks(hdc, convert, row.convert, dpi);
+    chunks(hdc, download, download_fraction);
+    chunks(hdc, convert, row.convert);
 }
 
-/// Bar metrics at 96 DPI. Everything but the border follows `scale`, so at 150%
-/// a block is 12 pixels with 3 between, the same shape as at 100%.
-/// Pixels of a bar column before the sunken bar, and after it.
+/// Pixels of a bar column before the sunken bar, and after it, at 96 DPI.
+/// They follow `scale`.
 const BAR_BEFORE: i32 = 6;
 const BAR_AFTER: i32 = 8;
-const BAR_CHUNK: i32 = 8;
+/// Space between blocks. Windows 98 uses 2 pixels at every DPI (comctl32's LED_GAP).
 const BAR_GAP: i32 = 2;
 /// DrawEdge inset. The sunken border is this thick on every side at any DPI.
 const BAR_BORDER: i32 = 2;
 /// The work list's sunken edge, in pixels. It does not follow `scale`.
 const LIST_EDGE: i32 = 2;
+/// Height of the overall progress bar at 96 DPI, border included.
+const OVERALL_BAR_H: i32 = 16;
 
 fn bar_before(dpi: i32) -> i32 {
     scale(BAR_BEFORE, dpi)
@@ -3608,12 +3606,28 @@ fn bar_after(dpi: i32) -> i32 {
     scale(BAR_AFTER, dpi)
 }
 
-fn bar_chunk(dpi: i32) -> i32 {
-    scale(BAR_CHUNK, dpi).max(1)
+/// Block width for a bar `outer_h` pixels tall, border included. Windows 98's
+/// progress control makes each block two thirds of the height inside the
+/// border, rounded like MulDiv (comctl32's get_led_size), so a taller bar at a
+/// higher DPI gets wider blocks.
+fn led_width(outer_h: i32) -> i32 {
+    let inner = (outer_h - BAR_BORDER * 2).max(0);
+    ((inner * 2 + 1) / 3).max(1)
 }
 
-fn bar_gap(dpi: i32) -> i32 {
-    scale(BAR_GAP, dpi).max(1)
+/// Height of a work-list row's bars, border included, for a row `row_h` pixels tall.
+fn row_bar_height(row_h: i32, dpi: i32) -> i32 {
+    (row_h - scale(6, dpi)).clamp(scale(8, dpi), scale(14, dpi))
+}
+
+/// Block width of the work-list row bars at `dpi`.
+fn row_led_width(dpi: i32) -> i32 {
+    led_width(row_bar_height(scale(18, dpi), dpi))
+}
+
+/// Block width of the overall bar at `dpi`.
+fn overall_led_width(dpi: i32) -> i32 {
+    led_width(scale(OVERALL_BAR_H, dpi))
 }
 
 /// How many blocks of `block` pixels with `gap` pixels between them fit in
@@ -3634,39 +3648,39 @@ fn blocks(width: i32, block: i32, gap: i32, fraction: f64) -> (i32, i32) {
     (cap, on.clamp(0, cap))
 }
 
-/// Outer width of a sunken bar that holds whole blocks and equal gaps at `dpi`.
-/// The largest `N * (block + gap) - gap + border` that fits in `outer`. A bar that
-/// is too narrow for one block is left as it is.
-fn bar_outer(outer: i32, dpi: i32) -> i32 {
-    if outer <= BAR_BORDER * 2 {
+/// Outer width of a sunken bar that holds whole `chunk`-wide blocks and equal
+/// gaps. The largest `N * (chunk + gap) - gap + border` that fits in `outer`.
+/// A bar that is too narrow for one block is left as it is.
+fn bar_outer(outer: i32, chunk: i32) -> i32 {
+    if outer <= BAR_BORDER * 2 || chunk <= 0 {
         return outer.max(0);
     }
-    let (chunk, gap) = (bar_chunk(dpi), bar_gap(dpi));
     let inner = outer - BAR_BORDER * 2;
-    let count = (inner + gap) / (chunk + gap);
+    let count = (inner + BAR_GAP) / (chunk + BAR_GAP);
     if count < 1 {
         return outer;
     }
-    count * (chunk + gap) - gap + BAR_BORDER * 2
+    count * (chunk + BAR_GAP) - BAR_GAP + BAR_BORDER * 2
 }
 
-/// Navy blocks inside a track of `width` pixels, as `(left, right)` pairs.
-/// Every block is whole. A bar fills one block at a time and shows them all
-/// only when it is finished.
-fn chunk_spans(width: i32, fraction: f64, dpi: i32) -> Vec<(i32, i32)> {
-    let (chunk, gap) = (bar_chunk(dpi), bar_gap(dpi));
-    let (_, on) = blocks(width, chunk, gap, fraction);
+/// Navy blocks `chunk` pixels wide inside a track of `width` pixels, as
+/// `(left, right)` pairs. Every block is whole. A bar fills one block at a time
+/// and shows them all only when it is finished.
+fn chunk_spans(width: i32, fraction: f64, chunk: i32) -> Vec<(i32, i32)> {
+    let (_, on) = blocks(width, chunk, BAR_GAP, fraction);
     (0..on)
         .map(|i| {
-            let left = i * (chunk + gap);
+            let left = i * (chunk + BAR_GAP);
             (left, left + chunk)
         })
         .collect()
 }
 
-fn chunks(hdc: HDC, mut outer: RECT, fraction: f64, dpi: i32) {
+/// Paints a sunken bar in `outer`. The block width comes from the bar's own height.
+fn chunks(hdc: HDC, mut outer: RECT, fraction: f64) {
     unsafe {
-        let snapped = bar_outer(outer.right - outer.left, dpi);
+        let chunk = led_width(outer.bottom - outer.top);
+        let snapped = bar_outer(outer.right - outer.left, chunk);
         outer.right = outer.left + snapped;
         let _ = DrawEdge(hdc, &mut outer, EDGE_SUNKEN, BF_RECT);
         let _ = InflateRect(&mut outer, -BAR_BORDER, -BAR_BORDER);
@@ -3675,7 +3689,7 @@ fn chunks(hdc: HDC, mut outer: RECT, fraction: f64, dpi: i32) {
             return;
         }
         let navy = CreateSolidBrush(rgb(0, 0, 128));
-        for (left, right) in chunk_spans(width, fraction, dpi) {
+        for (left, right) in chunk_spans(width, fraction, chunk) {
             let block = RECT { left: outer.left + left, top: outer.top, right: outer.left + right, bottom: outer.bottom };
             let _ = FillRect(hdc, &block, navy);
         }
@@ -3703,7 +3717,7 @@ fn note_name_width(name_column: i32, name_px: i32) -> i32 {
 fn columns(width: i32, dpi: i32) -> (i32, i32, i32, i32) {
     let (name, size, bar, _) = column_split(width);
     let inset = bar_before(dpi) + bar_after(dpi);
-    let fitted = bar_outer((bar - inset).max(0), dpi) + inset;
+    let fitted = bar_outer((bar - inset).max(0), row_led_width(dpi)) + inset;
     if fitted > inset && fitted < bar {
         let spare = (bar - fitted) * 2;
         return (name + spare, size, fitted, fitted);
@@ -3741,7 +3755,7 @@ fn opening_client(dpi: i32) -> (i32, i32) {
     for client in low..high {
         let host = client - 2 * border;
         let progress = host - scale(70, dpi);
-        if progress <= 0 || bar_outer(progress, dpi) != progress {
+        if progress <= 0 || bar_outer(progress, overall_led_width(dpi)) != progress {
             continue;
         }
         let dist = (client - want).abs();
@@ -3755,7 +3769,7 @@ fn opening_client(dpi: i32) -> (i32, i32) {
         }
         let (_, _, bar, _) = column_split(list);
         let painted = bar - (bar_before(dpi) + bar_after(dpi));
-        if painted > 0 && bar_outer(painted, dpi) == painted && dist < both_dist {
+        if painted > 0 && bar_outer(painted, row_led_width(dpi)) == painted && dist < both_dist {
             both_dist = dist;
             both = Some(client);
         }
@@ -5410,43 +5424,61 @@ mod tests {
 
     #[test]
     fn a_finished_bar_meets_the_right_edge() {
-        for dpi in [96, 120, 144, 192] {
-            let (chunk, gap) = (super::bar_chunk(dpi), super::bar_gap(dpi));
-            for outer in 12..700 {
-                let snapped = super::bar_outer(outer, dpi);
-                assert!(snapped <= outer, "dpi {dpi}: {outer} grew to {snapped}");
-                assert_eq!(super::bar_outer(snapped, dpi), snapped, "dpi {dpi}: {snapped}");
+        for chunk in 1..=20 {
+            for outer in 4..700 {
+                let snapped = super::bar_outer(outer, chunk);
+                assert!(snapped <= outer, "chunk {chunk}: {outer} grew to {snapped}");
+                assert_eq!(super::bar_outer(snapped, chunk), snapped, "chunk {chunk}: {snapped}");
                 let inner = snapped - 2 * super::BAR_BORDER;
                 if inner < chunk {
                     continue;
                 }
-                let spans = super::chunk_spans(inner, 1.0, dpi);
-                assert!(!spans.is_empty(), "dpi {dpi}: {outer}");
-                assert_eq!(spans[0].0, 0, "dpi {dpi}: {inner}");
-                assert_eq!(spans.last().unwrap().1, inner, "dpi {dpi}: {inner} {spans:?}");
+                let spans = super::chunk_spans(inner, 1.0, chunk);
+                assert!(!spans.is_empty(), "chunk {chunk}: {outer}");
+                assert_eq!(spans[0].0, 0, "chunk {chunk}: {inner}");
+                assert_eq!(spans.last().unwrap().1, inner, "chunk {chunk}: {inner} {spans:?}");
                 for (left, right) in &spans {
-                    assert_eq!(right - left, chunk, "dpi {dpi}: {inner} {spans:?}");
+                    assert_eq!(right - left, chunk, "chunk {chunk}: {inner} {spans:?}");
                 }
                 for pair in spans.windows(2) {
-                    assert_eq!(pair[1].0 - pair[0].1, gap, "dpi {dpi}: {inner} {spans:?}");
+                    assert_eq!(pair[1].0 - pair[0].1, 2, "chunk {chunk}: {inner} {spans:?}");
                 }
             }
         }
     }
 
     #[test]
-    fn bars_scale_with_dpi() {
-        // 100% keeps today's 8-pixel blocks and 2-pixel gaps.
-        assert_eq!((super::bar_chunk(96), super::bar_gap(96)), (8, 2));
-        assert_eq!((super::bar_chunk(120), super::bar_gap(120)), (10, 2));
-        assert_eq!((super::bar_chunk(144), super::bar_gap(144)), (12, 3));
-        assert_eq!((super::bar_before(144), super::bar_after(144)), (9, 12));
-        // Ten blocks: 10 * 8 + 9 * 2 = 98 inside, 102 with the border.
-        assert_eq!(super::bar_outer(102, 96), 102);
-        assert_eq!(super::bar_outer(108, 96), 102);
-        // Ten blocks at 150%: 10 * 12 + 9 * 3 = 147 inside, 151 with the border.
-        assert_eq!(super::bar_outer(151, 144), 151);
-        assert_eq!(super::bar_outer(160, 144), 151);
+    fn blocks_follow_the_windows_98_rule() {
+        // Two thirds of the height inside the 2-pixel border, rounded like MulDiv.
+        assert_eq!(super::led_width(16), 8);
+        assert_eq!(super::led_width(20), 11);
+        assert_eq!(super::led_width(24), 13);
+        assert_eq!(super::led_width(12), 5);
+        assert_eq!(super::led_width(4), 1);
+        assert_eq!(super::led_width(0), 1);
+        // The gap is 2 at every DPI.
+        assert_eq!(super::BAR_GAP, 2);
+        // Overall bar: 12 pixels inside at 96 DPI is an 8-pixel block, 20 inside at 144 is 13.
+        assert_eq!(super::scale(super::OVERALL_BAR_H, 96) - 4, 12);
+        assert_eq!(super::overall_led_width(96), 8);
+        assert_eq!(super::overall_led_width(120), 11);
+        assert_eq!(super::scale(super::OVERALL_BAR_H, 144) - 4, 20);
+        assert_eq!(super::overall_led_width(144), 13);
+        // Row bars: 12, 15 and 18 pixels tall, so 8, 11 and 14 inside.
+        assert_eq!(super::row_bar_height(super::scale(18, 96), 96), 12);
+        assert_eq!(super::row_bar_height(super::scale(18, 120), 120), 15);
+        assert_eq!(super::row_bar_height(super::scale(18, 144), 144), 18);
+        assert_eq!(super::row_led_width(96), 5);
+        assert_eq!(super::row_led_width(120), 7);
+        assert_eq!(super::row_led_width(144), 9);
+        // Ten 8-pixel blocks: 10 * 8 + 9 * 2 = 98 inside, 102 with the border.
+        assert_eq!(super::bar_outer(102, 8), 102);
+        assert_eq!(super::bar_outer(108, 8), 102);
+        // Ten 13-pixel blocks: 10 * 13 + 9 * 2 = 148 inside, 152 with the border.
+        assert_eq!(super::bar_outer(152, 13), 152);
+        assert_eq!(super::bar_outer(166, 13), 152);
+        // Ten 5-pixel row blocks: 10 * 5 + 9 * 2 = 68 inside, 72 with the border.
+        assert_eq!(super::bar_outer(74, 5), 72);
     }
 
     #[test]
@@ -5468,28 +5500,34 @@ mod tests {
             assert_eq!(on, pos * cap / 1000, "{pos}");
         }
 
-        // 10 blocks at 100%, so 79% shows 7 whole blocks and nothing of the 8th.
+        // Overall bar at 100%: 10 blocks, so 79% shows 7 whole blocks and nothing of the 8th.
         assert_eq!(
-            super::chunk_spans(98, 0.79, 96),
+            super::chunk_spans(98, 0.79, 8),
             vec![(0, 8), (10, 18), (20, 28), (30, 38), (40, 48), (50, 58), (60, 68)]
         );
-        assert!(super::chunk_spans(98, 0.05, 96).is_empty());
-        assert!(super::chunk_spans(98, 0.0, 96).is_empty());
-        assert_eq!(super::chunk_spans(98, 1.0, 96).len(), 10);
-        assert_eq!(super::chunk_spans(98, 1.0, 96).last(), Some(&(90, 98)));
-        assert_eq!(super::chunk_spans(18, 0.5, 96), vec![(0, 8)]);
-        assert!(super::chunk_spans(0, 1.0, 96).is_empty());
-        // 150%: 12-pixel blocks, 3-pixel gaps.
-        assert_eq!(super::chunk_spans(147, 0.79, 144).len(), 7);
-        assert_eq!(super::chunk_spans(147, 0.79, 144)[1], (15, 27));
-        assert_eq!(super::chunk_spans(147, 1.0, 144).last(), Some(&(135, 147)));
-        // A block is always whole, at every DPI and fraction.
-        for dpi in [96, 120, 144] {
-            let chunk = super::bar_chunk(dpi);
+        assert!(super::chunk_spans(98, 0.05, 8).is_empty());
+        assert!(super::chunk_spans(98, 0.0, 8).is_empty());
+        assert_eq!(super::chunk_spans(98, 1.0, 8).len(), 10);
+        assert_eq!(super::chunk_spans(98, 1.0, 8).last(), Some(&(90, 98)));
+        assert_eq!(super::chunk_spans(18, 0.5, 8), vec![(0, 8)]);
+        assert!(super::chunk_spans(0, 1.0, 8).is_empty());
+        // Overall bar at 150%: 13-pixel blocks, 2-pixel gaps.
+        assert_eq!(super::chunk_spans(148, 0.79, 13).len(), 7);
+        assert_eq!(super::chunk_spans(148, 0.79, 13)[1], (15, 28));
+        assert_eq!(super::chunk_spans(148, 1.0, 13).last(), Some(&(135, 148)));
+        // Row bar at 100%: 5-pixel blocks, so 68 inside holds 10.
+        assert_eq!(super::chunk_spans(68, 0.79, 5), vec![(0, 5), (7, 12), (14, 19), (21, 26), (28, 33), (35, 40), (42, 47)]);
+        assert_eq!(super::chunk_spans(68, 1.0, 5).last(), Some(&(63, 68)));
+        assert!(super::chunk_spans(68, 0.09, 5).is_empty());
+        // Row bar at 150%: 9-pixel blocks.
+        assert_eq!(super::chunk_spans(108, 0.5, 9).len(), 5);
+        assert_eq!(super::chunk_spans(108, 1.0, 9).last(), Some(&(99, 108)));
+        // A block is always whole, for every block width and fraction.
+        for chunk in [5, 7, 8, 9, 11, 13] {
             for pos in 0..=100 {
-                for (left, right) in super::chunk_spans(200, pos as f64 / 100.0, dpi) {
-                    assert_eq!(right - left, chunk, "dpi {dpi} pos {pos}");
-                    assert!(right <= 200, "dpi {dpi} pos {pos}");
+                for (left, right) in super::chunk_spans(200, pos as f64 / 100.0, chunk) {
+                    assert_eq!(right - left, chunk, "chunk {chunk} pos {pos}");
+                    assert!(right <= 200, "chunk {chunk} pos {pos}");
                 }
             }
         }
@@ -5503,28 +5541,30 @@ mod tests {
             let border = super::scale(3, dpi);
             let host = client - 2 * border;
             let progress = host - super::scale(70, dpi);
-            assert_eq!(super::bar_outer(progress, dpi), progress, "dpi {dpi} client {client}");
+            assert_eq!(super::bar_outer(progress, super::overall_led_width(dpi)), progress, "dpi {dpi} client {client}");
             let list = host - super::scale(16, dpi) - super::LIST_EDGE;
             let (_, _, bar, convert) = super::columns(list, dpi);
             assert_eq!(bar, convert);
             let painted = bar - (super::bar_before(dpi) + super::bar_after(dpi));
-            assert_eq!(super::bar_outer(painted, dpi), painted, "dpi {dpi} list {list} bar {bar}");
+            assert_eq!(super::bar_outer(painted, super::row_led_width(dpi)), painted, "dpi {dpi} list {list} bar {bar}");
             let want = super::scale(640, dpi);
             assert!((client - want).abs() <= 40, "dpi {dpi} opened at {client}, wanted near {want}");
             println!("dpi {dpi}: client {client}, overall bar {progress}, row bar {painted}");
         }
-        assert_eq!(super::opening_client(96).0, 658);
+        // 668 rather than the old 658: the row bars' 5-pixel Windows 98 blocks need a 7-pixel step.
+        assert_eq!(super::opening_client(96).0, 668);
     }
 
     #[test]
     fn row_bars_end_on_a_block_at_any_list_width() {
         for dpi in [96, 120, 144] {
+            let chunk = super::row_led_width(dpi);
             for list in 200..1400 {
                 let (_, _, bar, convert) = super::columns(list, dpi);
                 assert_eq!(bar, convert, "dpi {dpi} list {list}");
                 let painted = bar - (super::bar_before(dpi) + super::bar_after(dpi));
-                if painted > 2 * super::BAR_BORDER + super::bar_chunk(dpi) {
-                    assert_eq!(super::bar_outer(painted, dpi), painted, "dpi {dpi} list {list}");
+                if painted > 2 * super::BAR_BORDER + chunk {
+                    assert_eq!(super::bar_outer(painted, chunk), painted, "dpi {dpi} list {list}");
                 }
             }
         }
