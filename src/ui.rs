@@ -142,6 +142,8 @@ thread_local! {
     static THICKENING_NAME: Cell<bool> = const { Cell::new(false) };
     /// 8 pt bold, the same size as the list. A larger face spills past the editor.
     static MARK_TINY: Cell<HFONT> = const { Cell::new(HFONT(std::ptr::null_mut())) };
+    /// Screen DPI the overall progress bar paints its blocks at. Set when the app starts.
+    static BAR_DPI: Cell<i32> = const { Cell::new(96) };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -704,7 +706,7 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // does not paint that part, so this bar has to start white or the track is gray.
             let _ = FillRect(hdc, &rect, white_brush());
             let pos = GetWindowLongPtrW(hwnd, GWLP_USERDATA).clamp(0, 1000);
-            chunks(hdc, rect, pos as f64 / 1000.0);
+            chunks(hdc, rect, pos as f64 / 1000.0, BAR_DPI.get());
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -895,6 +897,7 @@ fn cancel_work() {
 impl App {
     fn boot(instance: HINSTANCE) -> Self {
         let dpi = screen_dpi();
+        BAR_DPI.set(dpi);
         let memory = store::load();
         let active = memory.last_profile.clone();
         let mut options = memory
@@ -1939,7 +1942,7 @@ impl App {
             let class = class_name(kid.hwnd);
             // A progress bar is a little shorter than its slot when the slot is
             // not an exact run of blocks, so the gaps stay equal.
-            let width = if class == "LinkProgressBar" { bar_outer(w).max(1) } else { w };
+            let width = if class == "LinkProgressBar" { bar_outer(w, self.dpi).max(1) } else { w };
             unsafe { let _ = MoveWindow(kid.hwnd, x, y, width, h, false); }
             if class == "SysListView32" {
                 // LVM_SETCOLUMNWIDTH. Fit the column to the inside of the list, so a guessed
@@ -3508,7 +3511,7 @@ fn paint_work(hwnd: HWND) {
             let mut header = RECT { left: 0, top: 0, right: width, bottom: header_h };
             let _ = FillRect(mem, &header, face);
             let _ = DrawEdge(mem, &mut header, EDGE_RAISED, BF_RECT);
-            let (name_w, size_w, download_w, convert_w) = columns(width);
+            let (name_w, size_w, download_w, convert_w) = columns(width, app.dpi);
             let _ = SetBkMode(mem, TRANSPARENT);
             let _ = SetTextColor(mem, rgb(0, 0, 0));
             text_in(mem, "File", RECT { left: 6, top: 0, right: name_w - 4, bottom: header_h }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -3521,7 +3524,7 @@ fn paint_work(hwnd: HWND) {
             let mut y = header_h;
             let mut index = app.list_scroll.max(0) as usize;
             while y < height && index < app.rows.len() {
-                paint_row(mem, &app.rows[index], RECT { left: 0, top: y, right: width, bottom: y + row_h }, name_w, size_w, download_w, convert_w);
+                paint_row(mem, &app.rows[index], RECT { left: 0, top: y, right: width, bottom: y + row_h }, name_w, size_w, download_w, convert_w, app.dpi);
                 y += row_h;
                 index += 1;
             }
@@ -3536,7 +3539,8 @@ fn paint_work(hwnd: HWND) {
     }
 }
 
-fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, download_w: i32, convert_w: i32) {
+#[allow(clippy::too_many_arguments)]
+fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, download_w: i32, convert_w: i32, dpi: i32) {
     let pinned = row.kind == RowKind::Pinned || (row.kind == RowKind::Failed && row.note != "Saved without a cover");
     let back = if pinned { rgb(255, 196, 196) } else { rgb(255, 255, 255) };
     let brush = unsafe { CreateSolidBrush(back) };
@@ -3564,98 +3568,105 @@ fn paint_row(hdc: HDC, row: &WorkRow, rect: RECT, name_w: i32, size_w: i32, down
         );
         return;
     }
-    let bar_h = ((rect.bottom - rect.top) - 6).clamp(8, 14);
+    let bar_h = ((rect.bottom - rect.top) - scale(6, dpi)).clamp(scale(8, dpi), scale(14, dpi));
     let top = rect.top + (rect.bottom - rect.top - bar_h) / 2;
+    let (before, after) = (bar_before(dpi), bar_after(dpi));
     let download = RECT {
-        left: rect.left + name_w + size_w + BAR_BEFORE,
+        left: rect.left + name_w + size_w + before,
         top,
-        right: rect.left + name_w + size_w + download_w - BAR_AFTER,
+        right: rect.left + name_w + size_w + download_w - after,
         bottom: top + bar_h,
     };
     let convert = RECT {
-        left: rect.left + name_w + size_w + download_w + BAR_BEFORE,
+        left: rect.left + name_w + size_w + download_w + before,
         top,
-        right: rect.left + name_w + size_w + download_w + convert_w - BAR_AFTER,
+        right: rect.left + name_w + size_w + download_w + convert_w - after,
         bottom: top + bar_h,
     };
     let download_fraction = if row.kind == RowKind::Pinned { 0.0 } else { row.fraction };
-    chunks(hdc, download, download_fraction);
-    chunks(hdc, convert, row.convert);
+    chunks(hdc, download, download_fraction, dpi);
+    chunks(hdc, convert, row.convert, dpi);
 }
 
+/// Bar metrics at 96 DPI. Everything but the border follows `scale`, so at 150%
+/// a block is 12 pixels with 3 between, the same shape as at 100%.
 /// Pixels of a bar column before the sunken bar, and after it.
 const BAR_BEFORE: i32 = 6;
 const BAR_AFTER: i32 = 8;
 const BAR_CHUNK: i32 = 8;
 const BAR_GAP: i32 = 2;
-/// DrawEdge inset. The sunken border is this thick on every side.
+/// DrawEdge inset. The sunken border is this thick on every side at any DPI.
 const BAR_BORDER: i32 = 2;
 /// The work list's sunken edge, in pixels. It does not follow `scale`.
 const LIST_EDGE: i32 = 2;
 
-/// Outer width of a sunken bar that holds whole blocks and equal gaps.
-/// The largest `10N + 2` that fits in `outer`. A bar that is too narrow for
-/// one block is left as it is.
-fn bar_outer(outer: i32) -> i32 {
+fn bar_before(dpi: i32) -> i32 {
+    scale(BAR_BEFORE, dpi)
+}
+
+fn bar_after(dpi: i32) -> i32 {
+    scale(BAR_AFTER, dpi)
+}
+
+fn bar_chunk(dpi: i32) -> i32 {
+    scale(BAR_CHUNK, dpi).max(1)
+}
+
+fn bar_gap(dpi: i32) -> i32 {
+    scale(BAR_GAP, dpi).max(1)
+}
+
+/// How many blocks of `block` pixels with `gap` pixels between them fit in
+/// `width`, and how many of those to fill for `fraction`. Only whole blocks
+/// fill: anything short of a finished bar rounds down. Same rule as
+/// podcast-trim's `progress::blocks`.
+fn blocks(width: i32, block: i32, gap: i32, fraction: f64) -> (i32, i32) {
+    if width < block || block <= 0 {
+        return (0, 0);
+    }
+    let cap = (width + gap) / (block + gap);
+    let fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+    if fraction >= 1.0 {
+        return (cap, cap);
+    }
+    // The tiny allowance keeps 0.3 of 10 at 3 blocks, not 2.999... rounded down to 2.
+    let on = ((cap as f64) * fraction + 1e-9).floor() as i32;
+    (cap, on.clamp(0, cap))
+}
+
+/// Outer width of a sunken bar that holds whole blocks and equal gaps at `dpi`.
+/// The largest `N * (block + gap) - gap + border` that fits in `outer`. A bar that
+/// is too narrow for one block is left as it is.
+fn bar_outer(outer: i32, dpi: i32) -> i32 {
     if outer <= BAR_BORDER * 2 {
         return outer.max(0);
     }
+    let (chunk, gap) = (bar_chunk(dpi), bar_gap(dpi));
     let inner = outer - BAR_BORDER * 2;
-    let count = (inner + BAR_GAP) / (BAR_CHUNK + BAR_GAP);
+    let count = (inner + gap) / (chunk + gap);
     if count < 1 {
         return outer;
     }
-    count * (BAR_CHUNK + BAR_GAP) - BAR_GAP + BAR_BORDER * 2
+    count * (chunk + gap) - gap + BAR_BORDER * 2
 }
 
 /// Navy blocks inside a track of `width` pixels, as `(left, right)` pairs.
-/// Blocks are 8 pixels and gaps are 2. While the bar is still filling, the
-/// last block may stop on any pixel of its 8. The track width is chosen so a
-/// finished bar ends on a block, so a short stub is not painted.
-fn chunk_spans(width: i32, fraction: f64) -> Vec<(i32, i32)> {
-    if width <= 0 {
-        return Vec::new();
-    }
-    let fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
-    if fraction <= 0.0 {
-        return Vec::new();
-    }
-    // Stay short of the edge until the bar is actually finished.
-    let filled = if fraction >= 1.0 {
-        width
-    } else {
-        let px = (fraction * width as f64).round() as i32;
-        px.clamp(0, width - 1)
-    };
-    if filled <= 0 {
-        return Vec::new();
-    }
-    let mut spans = Vec::new();
-    let mut x = 0;
-    while x < width {
-        let block_right = x + BAR_CHUNK;
-        if fraction >= 1.0 {
-            if block_right > width {
-                break;
-            }
-            spans.push((x, block_right));
-        } else {
-            if x >= filled {
-                break;
-            }
-            let right = block_right.min(filled);
-            if right > x {
-                spans.push((x, right));
-            }
-        }
-        x = block_right + BAR_GAP;
-    }
-    spans
+/// Every block is whole. A bar fills one block at a time and shows them all
+/// only when it is finished.
+fn chunk_spans(width: i32, fraction: f64, dpi: i32) -> Vec<(i32, i32)> {
+    let (chunk, gap) = (bar_chunk(dpi), bar_gap(dpi));
+    let (_, on) = blocks(width, chunk, gap, fraction);
+    (0..on)
+        .map(|i| {
+            let left = i * (chunk + gap);
+            (left, left + chunk)
+        })
+        .collect()
 }
 
-fn chunks(hdc: HDC, mut outer: RECT, fraction: f64) {
+fn chunks(hdc: HDC, mut outer: RECT, fraction: f64, dpi: i32) {
     unsafe {
-        let snapped = bar_outer(outer.right - outer.left);
+        let snapped = bar_outer(outer.right - outer.left, dpi);
         outer.right = outer.left + snapped;
         let _ = DrawEdge(hdc, &mut outer, EDGE_SUNKEN, BF_RECT);
         let _ = InflateRect(&mut outer, -BAR_BORDER, -BAR_BORDER);
@@ -3664,7 +3675,7 @@ fn chunks(hdc: HDC, mut outer: RECT, fraction: f64) {
             return;
         }
         let navy = CreateSolidBrush(rgb(0, 0, 128));
-        for (left, right) in chunk_spans(width, fraction) {
+        for (left, right) in chunk_spans(width, fraction, dpi) {
             let block = RECT { left: outer.left + left, top: outer.top, right: outer.left + right, bottom: outer.bottom };
             let _ = FillRect(hdc, &block, navy);
         }
@@ -3689,10 +3700,10 @@ fn note_name_width(name_column: i32, name_px: i32) -> i32 {
     fitted.clamp(floor, name_column)
 }
 
-fn columns(width: i32) -> (i32, i32, i32, i32) {
+fn columns(width: i32, dpi: i32) -> (i32, i32, i32, i32) {
     let (name, size, bar, _) = column_split(width);
-    let inset = BAR_BEFORE + BAR_AFTER;
-    let fitted = bar_outer((bar - inset).max(0)) + inset;
+    let inset = bar_before(dpi) + bar_after(dpi);
+    let fitted = bar_outer((bar - inset).max(0), dpi) + inset;
     if fitted > inset && fitted < bar {
         let spare = (bar - fitted) * 2;
         return (name + spare, size, fitted, fitted);
@@ -3730,7 +3741,7 @@ fn opening_client(dpi: i32) -> (i32, i32) {
     for client in low..high {
         let host = client - 2 * border;
         let progress = host - scale(70, dpi);
-        if progress <= 0 || bar_outer(progress) != progress {
+        if progress <= 0 || bar_outer(progress, dpi) != progress {
             continue;
         }
         let dist = (client - want).abs();
@@ -3743,8 +3754,8 @@ fn opening_client(dpi: i32) -> (i32, i32) {
             continue;
         }
         let (_, _, bar, _) = column_split(list);
-        let painted = bar - (BAR_BEFORE + BAR_AFTER);
-        if painted > 0 && bar_outer(painted) == painted && dist < both_dist {
+        let painted = bar - (bar_before(dpi) + bar_after(dpi));
+        if painted > 0 && bar_outer(painted, dpi) == painted && dist < both_dist {
             both_dist = dist;
             both = Some(client);
         }
@@ -5399,29 +5410,89 @@ mod tests {
 
     #[test]
     fn a_finished_bar_meets_the_right_edge() {
-        for outer in 12..500 {
-            let snapped = super::bar_outer(outer);
-            assert!(snapped <= outer, "{outer} grew to {snapped}");
-            assert_eq!(super::bar_outer(snapped), snapped, "{snapped}");
-            let inner = snapped - 4;
-            let spans = super::chunk_spans(inner, 1.0);
-            assert!(!spans.is_empty(), "{outer}");
-            assert_eq!(spans[0].0, 0, "{inner}");
-            assert_eq!(spans.last().unwrap().1, inner, "{inner} {spans:?}");
-            for (left, right) in &spans {
-                assert_eq!(right - left, 8, "{inner} {spans:?}");
-            }
-            for pair in spans.windows(2) {
-                assert_eq!(pair[1].0 - pair[0].1, 2, "{inner} {spans:?}");
+        for dpi in [96, 120, 144, 192] {
+            let (chunk, gap) = (super::bar_chunk(dpi), super::bar_gap(dpi));
+            for outer in 12..700 {
+                let snapped = super::bar_outer(outer, dpi);
+                assert!(snapped <= outer, "dpi {dpi}: {outer} grew to {snapped}");
+                assert_eq!(super::bar_outer(snapped, dpi), snapped, "dpi {dpi}: {snapped}");
+                let inner = snapped - 2 * super::BAR_BORDER;
+                if inner < chunk {
+                    continue;
+                }
+                let spans = super::chunk_spans(inner, 1.0, dpi);
+                assert!(!spans.is_empty(), "dpi {dpi}: {outer}");
+                assert_eq!(spans[0].0, 0, "dpi {dpi}: {inner}");
+                assert_eq!(spans.last().unwrap().1, inner, "dpi {dpi}: {inner} {spans:?}");
+                for (left, right) in &spans {
+                    assert_eq!(right - left, chunk, "dpi {dpi}: {inner} {spans:?}");
+                }
+                for pair in spans.windows(2) {
+                    assert_eq!(pair[1].0 - pair[0].1, gap, "dpi {dpi}: {inner} {spans:?}");
+                }
             }
         }
-        // Still filling: stop on any pixel of a block, and leave the gaps white.
-        assert_eq!(super::chunk_spans(100, 0.05), vec![(0, 5)]);
-        assert_eq!(super::chunk_spans(100, 0.15), vec![(0, 8), (10, 15)]);
-        assert_eq!(super::chunk_spans(16, 0.5), vec![(0, 8)]);
-        assert_eq!(super::chunk_spans(18, 1.0), vec![(0, 8), (10, 18)]);
-        assert!(super::chunk_spans(16, 0.0).is_empty());
-        assert!(super::chunk_spans(0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn bars_scale_with_dpi() {
+        // 100% keeps today's 8-pixel blocks and 2-pixel gaps.
+        assert_eq!((super::bar_chunk(96), super::bar_gap(96)), (8, 2));
+        assert_eq!((super::bar_chunk(120), super::bar_gap(120)), (10, 2));
+        assert_eq!((super::bar_chunk(144), super::bar_gap(144)), (12, 3));
+        assert_eq!((super::bar_before(144), super::bar_after(144)), (9, 12));
+        // Ten blocks: 10 * 8 + 9 * 2 = 98 inside, 102 with the border.
+        assert_eq!(super::bar_outer(102, 96), 102);
+        assert_eq!(super::bar_outer(108, 96), 102);
+        // Ten blocks at 150%: 10 * 12 + 9 * 3 = 147 inside, 151 with the border.
+        assert_eq!(super::bar_outer(151, 144), 151);
+        assert_eq!(super::bar_outer(160, 144), 151);
+    }
+
+    #[test]
+    fn bars_fill_in_whole_blocks_only() {
+        // podcast-trim's rule: count the blocks that fit, then floor.
+        assert_eq!(super::blocks(98, 8, 2, 0.79), (10, 7));
+        assert_eq!(super::blocks(98, 8, 2, 0.3), (10, 3));
+        assert_eq!(super::blocks(98, 8, 2, 0.999), (10, 9));
+        assert_eq!(super::blocks(98, 8, 2, 1.0), (10, 10));
+        assert_eq!(super::blocks(98, 8, 2, 1.5), (10, 10));
+        assert_eq!(super::blocks(98, 8, 2, 0.05), (10, 0));
+        assert_eq!(super::blocks(98, 8, 2, 0.0), (10, 0));
+        assert_eq!(super::blocks(98, 8, 2, -1.0), (10, 0));
+        assert_eq!(super::blocks(98, 8, 2, f64::NAN), (10, 0));
+        assert_eq!(super::blocks(4, 8, 2, 1.0), (0, 0));
+        // Every PBM_SETPOS position lands on whole blocks.
+        for pos in 0..=1000 {
+            let (cap, on) = super::blocks(98, 8, 2, pos as f64 / 1000.0);
+            assert_eq!(on, pos * cap / 1000, "{pos}");
+        }
+
+        // 10 blocks at 100%, so 79% shows 7 whole blocks and nothing of the 8th.
+        assert_eq!(
+            super::chunk_spans(98, 0.79, 96),
+            vec![(0, 8), (10, 18), (20, 28), (30, 38), (40, 48), (50, 58), (60, 68)]
+        );
+        assert!(super::chunk_spans(98, 0.05, 96).is_empty());
+        assert!(super::chunk_spans(98, 0.0, 96).is_empty());
+        assert_eq!(super::chunk_spans(98, 1.0, 96).len(), 10);
+        assert_eq!(super::chunk_spans(98, 1.0, 96).last(), Some(&(90, 98)));
+        assert_eq!(super::chunk_spans(18, 0.5, 96), vec![(0, 8)]);
+        assert!(super::chunk_spans(0, 1.0, 96).is_empty());
+        // 150%: 12-pixel blocks, 3-pixel gaps.
+        assert_eq!(super::chunk_spans(147, 0.79, 144).len(), 7);
+        assert_eq!(super::chunk_spans(147, 0.79, 144)[1], (15, 27));
+        assert_eq!(super::chunk_spans(147, 1.0, 144).last(), Some(&(135, 147)));
+        // A block is always whole, at every DPI and fraction.
+        for dpi in [96, 120, 144] {
+            let chunk = super::bar_chunk(dpi);
+            for pos in 0..=100 {
+                for (left, right) in super::chunk_spans(200, pos as f64 / 100.0, dpi) {
+                    assert_eq!(right - left, chunk, "dpi {dpi} pos {pos}");
+                    assert!(right <= 200, "dpi {dpi} pos {pos}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5432,16 +5503,31 @@ mod tests {
             let border = super::scale(3, dpi);
             let host = client - 2 * border;
             let progress = host - super::scale(70, dpi);
-            assert_eq!(super::bar_outer(progress), progress, "dpi {dpi} client {client}");
+            assert_eq!(super::bar_outer(progress, dpi), progress, "dpi {dpi} client {client}");
             let list = host - super::scale(16, dpi) - super::LIST_EDGE;
-            let (_, _, bar, convert) = super::columns(list);
+            let (_, _, bar, convert) = super::columns(list, dpi);
             assert_eq!(bar, convert);
-            let painted = bar - (super::BAR_BEFORE + super::BAR_AFTER);
-            assert_eq!(super::bar_outer(painted), painted, "dpi {dpi} list {list} bar {bar}");
+            let painted = bar - (super::bar_before(dpi) + super::bar_after(dpi));
+            assert_eq!(super::bar_outer(painted, dpi), painted, "dpi {dpi} list {list} bar {bar}");
             let want = super::scale(640, dpi);
             assert!((client - want).abs() <= 40, "dpi {dpi} opened at {client}, wanted near {want}");
+            println!("dpi {dpi}: client {client}, overall bar {progress}, row bar {painted}");
         }
         assert_eq!(super::opening_client(96).0, 658);
+    }
+
+    #[test]
+    fn row_bars_end_on_a_block_at_any_list_width() {
+        for dpi in [96, 120, 144] {
+            for list in 200..1400 {
+                let (_, _, bar, convert) = super::columns(list, dpi);
+                assert_eq!(bar, convert, "dpi {dpi} list {list}");
+                let painted = bar - (super::bar_before(dpi) + super::bar_after(dpi));
+                if painted > 2 * super::BAR_BORDER + super::bar_chunk(dpi) {
+                    assert_eq!(super::bar_outer(painted, dpi), painted, "dpi {dpi} list {list}");
+                }
+            }
+        }
     }
 
     #[test]
