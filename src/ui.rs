@@ -5376,7 +5376,7 @@ pub(crate) fn make_font(pt: i32, dpi: i32, bold: bool) -> HFONT {
             1,
             0,
             0,
-            0,
+            classic::TEXT_QUALITY,
             0,
             w!("MS Sans Serif"),
         )

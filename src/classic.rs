@@ -5,7 +5,7 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject, SetBkMode,
-    SetTextColor, DEFAULT_QUALITY, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    SetTextColor, NONANTIALIASED_QUALITY, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
     HDC, HFONT, TRANSPARENT,
 };
 
@@ -87,6 +87,12 @@ pub fn scale(px: i32, dpi: i32) -> i32 {
     px * dpi / 96
 }
 
+/// Font quality for every font the app makes. The MS Sans Serif bitmap font is never smoothed, so
+/// where Windows uses it (100% scaling) this changes nothing. At other scaling Windows can draw the
+/// TrueType Microsoft Sans Serif instead, and default quality smooths it into thin, grey, soft text.
+/// Without smoothing it stays sharp and dark, the way Windows 98 drew it.
+pub const TEXT_QUALITY: u32 = NONANTIALIASED_QUALITY.0 as u32;
+
 pub fn caption_font(dpi: i32) -> HFONT {
     unsafe {
         CreateFontW(
@@ -101,7 +107,7 @@ pub fn caption_font(dpi: i32) -> HFONT {
             1,
             0,
             0,
-            DEFAULT_QUALITY.0 as u32,
+            TEXT_QUALITY,
             0,
             w!("MS Sans Serif"),
         )
